@@ -268,10 +268,10 @@ index 0000000..9863a2e
 +}
 diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
 new file mode 100644
-index 0000000..7ad8cc9
+index 0000000..0978ff9
 --- /dev/null
 +++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,393 @@
 +package com.maxrave.media3.voice
 +
 +import android.Manifest
@@ -296,7 +296,6 @@ index 0000000..7ad8cc9
 +import androidx.core.app.ServiceCompat
 +import androidx.core.content.ContextCompat
 +import androidx.media3.common.MediaItem
-+import androidx.media3.common.MediaMetadata
 +import androidx.media3.session.MediaController
 +import androidx.media3.session.SessionToken
 +import com.maxrave.logger.Logger
@@ -489,11 +488,6 @@ index 0000000..7ad8cc9
 +    }
 +
 +    private fun playLikedQuery(query: String) {
-+        val metadata =
-+            MediaMetadata
-+                .Builder()
-+                .setSearchQuery(query)
-+                .build()
 +        val item =
 +            MediaItem
 +                .Builder()
@@ -503,8 +497,7 @@ index 0000000..7ad8cc9
 +                        .Builder()
 +                        .setSearchQuery(query)
 +                        .build(),
-+                ).setMediaMetadata(metadata)
-+                .build()
++                ).build()
 +        withController { c ->
 +            c.setMediaItem(item)
 +            c.prepare()
