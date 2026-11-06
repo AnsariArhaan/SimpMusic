@@ -95,6 +95,9 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+            signingConfig = signingConfigs.getByName("voiceTest")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -112,12 +115,6 @@ android {
             isMinifyEnabled = false
             applicationIdSuffix = ".dev"
             versionNameSuffix = "-dev"
-        }
-        create("releaseDev") {
-            initWith(getByName("release"))
-            applicationIdSuffix = ".dev"
-            versionNameSuffix = "-dev"
-            signingConfig = signingConfigs.getByName("voiceTest")
         }
     }
     compileOptions {

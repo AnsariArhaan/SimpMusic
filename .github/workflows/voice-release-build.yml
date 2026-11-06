@@ -40,7 +40,7 @@ jobs:
         run: ./gradlew :media3:testDebugUnitTest --stacktrace
 
       - name: Build optimized release-dev APK
-        run: ./gradlew :androidApp:assembleReleaseDev --stacktrace
+        run: ./gradlew :androidApp:assembleRelease --stacktrace
         env:
           SIGN_STORE_FILE: ${{ runner.temp }}/voice-test.keystore
           SIGN_STORE_PASSWORD: ${{ secrets.VOICE_SIGN_STORE_PASSWORD }}
