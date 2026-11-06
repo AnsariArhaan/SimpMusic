@@ -268,10 +268,10 @@ index 0000000..9863a2e
 +}
 diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
 new file mode 100644
-index 0000000..0978ff9
+index 0000000..0d8be93
 --- /dev/null
 +++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,434 @@
 +package com.maxrave.media3.voice
 +
 +import android.Manifest
@@ -343,6 +343,8 @@ index 0000000..0978ff9
 +    private enum class Stage { LOADING, WAKE, COMMAND }
 +
 +    private var stage = Stage.LOADING
++    private var loading = false
++    private var consecutiveErrors = 0
 +    private var model: Model? = null
 +    private var speechService: SpeechService? = null
 +    private var wakeLock: PowerManager.WakeLock? = null
@@ -370,23 +372,41 @@ index 0000000..0978ff9
 +                return START_NOT_STICKY
 +            }
 +            ACTION_START -> {
-+                if (running.value || stage == Stage.LOADING) return START_STICKY
-+                if (
-+                    ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
-+                    PackageManager.PERMISSION_GRANTED
-+                ) {
-+                    Logger.w(TAG, "start refused: RECORD_AUDIO not granted")
-+                    shutdown()
-+                    return START_NOT_STICKY
++                // Launched via startForegroundService() (the Settings toggle), so
++                // startForeground() MUST run before every return path - VoiceStartGate orders
++                // FOREGROUND first. Returning without it was the v3 crash
++                // (ForegroundServiceDidNotStartInTimeException).
++                val steps =
++                    VoiceStartGate.stepsFor(
++                        alreadyRunning = running.value,
++                        modelLoading = loading,
++                        micPermissionGranted = micPermissionGranted(),
++                    )
++                for (step in steps) {
++                    when (step) {
++                        VoiceStartGate.Step.FOREGROUND -> startForegroundWithNotification()
++                        VoiceStartGate.Step.LOAD_MODEL -> {
++                            loading = true
++                            acquireWakeLock()
++                            loadModel()
++                        }
++                        VoiceStartGate.Step.SHUTDOWN -> {
++                            Logger.w(TAG, "start refused: RECORD_AUDIO not granted")
++                            shutdown()
++                        }
++                    }
 +                }
-+                startForegroundWithNotification()
-+                acquireWakeLock()
-+                loadModel()
-+                return START_STICKY
++                // User-controlled listener: never auto-restarted by the system after a kill
++                // (stock-Android background-start limits); the user re-enables from Settings.
++                return START_NOT_STICKY
 +            }
 +            else -> return START_NOT_STICKY
 +        }
 +    }
++
++    private fun micPermissionGranted(): Boolean =
++        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
++            PackageManager.PERMISSION_GRANTED
 +
 +    private fun startForegroundWithNotification() {
 +        val nm = getSystemService(NotificationManager::class.java)
@@ -433,10 +453,12 @@ index 0000000..0978ff9
 +            "model-en-us",
 +            "voice-model",
 +            { unpacked ->
++                loading = false
 +                model = unpacked
 +                enterWakeStage()
 +            },
 +            { error ->
++                loading = false
 +                Logger.e(TAG, "model unpack failed: ${error.message}")
 +                shutdown()
 +            },
@@ -463,6 +485,7 @@ index 0000000..0978ff9
 +    private fun enterCommandStage() {
 +        if (stopping) return
 +        val m = model ?: return
++        consecutiveErrors = 0
 +        stage = Stage.COMMAND
 +        lastCommandPartial = ""
 +        releaseSpeech()
@@ -582,11 +605,29 @@ index 0000000..0978ff9
 +
 +    override fun onError(exception: Exception?) {
 +        Logger.e(TAG, "recognizer error: ${exception?.message}")
-+        if (!stopping && stage != Stage.LOADING) enterWakeStage()
++        handleRecognizerFault("error")
 +    }
 +
 +    override fun onTimeout() {
-+        if (!stopping && stage != Stage.LOADING) enterWakeStage()
++        Logger.w(TAG, "recognizer timeout")
++        handleRecognizerFault("timeout")
++    }
++
++    /**
++     * Back to the wake stage after a fault, but bounded: after
++     * [VoiceStartGate.MAX_CONSECUTIVE_ERRORS] faults in a row (e.g. a dead mic path) the listener
++     * shuts down instead of spinning a re-init loop that would burn battery.
++     */
++    private fun handleRecognizerFault(kind: String) {
++        if (stopping || stage == Stage.LOADING) return
++        if (stage == Stage.COMMAND) restorePlayback()
++        consecutiveErrors += 1
++        if (consecutiveErrors >= VoiceStartGate.MAX_CONSECUTIVE_ERRORS) {
++            Logger.e(TAG, "stopping after $consecutiveErrors consecutive recognizer ${kind}s")
++            shutdown()
++        } else {
++            enterWakeStage()
++        }
 +    }
 +
 +    private fun extractText(
@@ -665,6 +706,45 @@ index 0000000..0978ff9
 +        super.onDestroy()
 +    }
 +}
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceStartGate.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceStartGate.kt
+new file mode 100644
+index 0000000..ec15714
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceStartGate.kt
+@@ -0,0 +1,33 @@
++package com.maxrave.media3.voice
++
++/**
++ * Pure decision logic for [VoiceListenService]'s ACTION_START handling, kept Android-free so unit
++ * tests can pin the crash-critical invariant: the service is launched with
++ * startForegroundService(), so startForeground() must run before EVERY return path. In v3 the
++ * re-entry guard (and the permission-denied path) returned first, which is exactly the
++ * ForegroundServiceDidNotStartInTimeException the user hit on Android 16.
++ */
++object VoiceStartGate {
++    enum class Step { FOREGROUND, LOAD_MODEL, SHUTDOWN }
++
++    /**
++     * Ordered steps for one ACTION_START intent. FOREGROUND, when returned, is always first;
++     * whatever follows, the foreground contract is satisfied before anything else runs.
++     */
++    fun stepsFor(
++        alreadyRunning: Boolean,
++        modelLoading: Boolean,
++        micPermissionGranted: Boolean,
++    ): List<Step> =
++        when {
++            // Re-entry (toggle tapped again while running or while the model unpacks):
++            // satisfy the foreground contract, change nothing else.
++            alreadyRunning || modelLoading -> listOf(Step.FOREGROUND)
++            // Refused, but still after foregrounding so the started service is closed cleanly.
++            !micPermissionGranted -> listOf(Step.FOREGROUND, Step.SHUTDOWN)
++            else -> listOf(Step.FOREGROUND, Step.LOAD_MODEL)
++        }
++
++    /** Consecutive recognizer faults tolerated before the listener shuts itself down. */
++    const val MAX_CONSECUTIVE_ERRORS = 3
++}
 diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt
 new file mode 100644
 index 0000000..7df7233
@@ -717,5 +797,72 @@ index 0000000..7df7233
 +    @Test
 +    fun doesNotStripPlayInsideTitle() {
 +        assertEquals("play date", VoiceCommandParser.commandFrom("hey ben play play date"))
++    }
++}
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceStartGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceStartGateTest.kt
+new file mode 100644
+index 0000000..71382e4
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceStartGateTest.kt
+@@ -0,0 +1,61 @@
++package com.maxrave.media3.voice
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * Regression tests for the v3 crash (ForegroundServiceDidNotStartInTimeException): every
++ * ACTION_START path must foreground the service before doing anything else.
++ */
++class VoiceStartGateTest {
++    @Test
++    fun freshStartForegroundsThenLoadsModel() {
++        assertEquals(
++            listOf(VoiceStartGate.Step.FOREGROUND, VoiceStartGate.Step.LOAD_MODEL),
++            VoiceStartGate.stepsFor(alreadyRunning = false, modelLoading = false, micPermissionGranted = true),
++        )
++    }
++
++    @Test
++    fun retapWhileModelLoadsStillForegrounds() {
++        // v3 bug: this path returned WITHOUT foregrounding. The "loading" signal was the stage
++        // field's initial value, so even the very first tap took it - crash on every tap.
++        assertEquals(
++            listOf(VoiceStartGate.Step.FOREGROUND),
++            VoiceStartGate.stepsFor(alreadyRunning = false, modelLoading = true, micPermissionGranted = true),
++        )
++    }
++
++    @Test
++    fun alreadyRunningOnlyReforegrounds() {
++        assertEquals(
++            listOf(VoiceStartGate.Step.FOREGROUND),
++            VoiceStartGate.stepsFor(alreadyRunning = true, modelLoading = false, micPermissionGranted = true),
++        )
++    }
++
++    @Test
++    fun deniedPermissionForegroundsBeforeShutdown() {
++        // v3 bug: shutdown without foregrounding - same crash class.
++        assertEquals(
++            listOf(VoiceStartGate.Step.FOREGROUND, VoiceStartGate.Step.SHUTDOWN),
++            VoiceStartGate.stepsFor(alreadyRunning = false, modelLoading = false, micPermissionGranted = false),
++        )
++    }
++
++    @Test
++    fun foregroundLeadsEveryPath() {
++        for (running in listOf(true, false)) {
++            for (loading in listOf(true, false)) {
++                for (granted in listOf(true, false)) {
++                    val steps = VoiceStartGate.stepsFor(running, loading, granted)
++                    assertEquals(
++                        "foreground must lead every path for ($running, $loading, $granted)",
++                        VoiceStartGate.Step.FOREGROUND,
++                        steps.first(),
++                    )
++                }
++            }
++        }
 +    }
 +}
