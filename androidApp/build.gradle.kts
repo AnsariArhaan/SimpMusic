@@ -83,6 +83,14 @@ android {
         }
     }
 
+    signingConfigs {
+        create("voiceTest") {
+            storeFile = System.getenv("SIGN_STORE_FILE")?.let { file(it) }
+            storePassword = System.getenv("SIGN_STORE_PASSWORD")
+            keyAlias = System.getenv("SIGN_KEY_ALIAS")
+            keyPassword = System.getenv("SIGN_KEY_PASSWORD")
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -104,6 +112,12 @@ android {
             isMinifyEnabled = false
             applicationIdSuffix = ".dev"
             versionNameSuffix = "-dev"
+        }
+        create("releaseDev") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+            signingConfig = signingConfigs.getByName("voiceTest")
         }
     }
     compileOptions {
