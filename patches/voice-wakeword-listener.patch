@@ -13,10 +13,10 @@ index 0321cb0..468145f 100644
      implementation(libs.car.app.core)
      implementation(libs.car.app.projected)
 diff --git a/media/media3/consumer-rules.pro b/media/media3/consumer-rules.pro
-index e69de29..3adc86a 100644
+index e69de29..4b95fc2 100644
 --- a/media/media3/consumer-rules.pro
 +++ b/media/media3/consumer-rules.pro
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,13 @@
 +# JNA (net.java.dev.jna:jna, transitive of com.alphacephei:vosk-android) is reflection+JNI
 +# driven and ships no keep rules of its own (verified in both AARs): jnidispatch looks up
 +# com.sun.jna.Pointer.peer and JNA's direct-mapped native methods BY NAME at runtime.
@@ -26,6 +26,10 @@ index e69de29..3adc86a 100644
 +# org.vosk.LibVosk's direct-mapped natives (vosk_model_new, vosk_recognizer_new, ...) and the
 +# PointerType subclasses (Model, Recognizer, SpeakerModel) are bound/read through JNA.
 +-keep class org.vosk.** { *; }
++# JNA's Native$AWT helper (kept by the rule above) references java.awt.*, which does not exist
++# on Android; R8 hard-errors on the missing types. Dead code on Android - Vosk never requests
++# AWT component IDs. Verified the only non-Android reference surface in all of JNA 5.18.1.
++-dontwarn java.awt.**
 diff --git a/media/media3/src/main/assets/voice-oss-notices.txt b/media/media3/src/main/assets/voice-oss-notices.txt
 new file mode 100644
 index 0000000..55ee575
