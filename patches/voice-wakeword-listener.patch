@@ -12,6 +12,20 @@ index 0321cb0..468145f 100644
      // Android Auto (Car App Library media templates)
      implementation(libs.car.app.core)
      implementation(libs.car.app.projected)
+diff --git a/media/media3/consumer-rules.pro b/media/media3/consumer-rules.pro
+index e69de29..3adc86a 100644
+--- a/media/media3/consumer-rules.pro
++++ b/media/media3/consumer-rules.pro
+@@ -0,0 +1,9 @@
++# JNA (net.java.dev.jna:jna, transitive of com.alphacephei:vosk-android) is reflection+JNI
++# driven and ships no keep rules of its own (verified in both AARs): jnidispatch looks up
++# com.sun.jna.Pointer.peer and JNA's direct-mapped native methods BY NAME at runtime.
++# R8 stripping/renaming them kills the first Model load with
++# UnsatisfiedLinkError "Can't obtain peer field ID for class com.sun.jna.Pointer".
++-keep class com.sun.jna.** { *; }
++# org.vosk.LibVosk's direct-mapped natives (vosk_model_new, vosk_recognizer_new, ...) and the
++# PointerType subclasses (Model, Recognizer, SpeakerModel) are bound/read through JNA.
++-keep class org.vosk.** { *; }
 diff --git a/media/media3/src/main/assets/voice-oss-notices.txt b/media/media3/src/main/assets/voice-oss-notices.txt
 new file mode 100644
 index 0000000..55ee575
