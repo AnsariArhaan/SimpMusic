@@ -1,0 +1,144 @@
+From 3ae04085e1d18b5d4cbb96f0b49f9814cf805856 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Fri, 6 Nov 2026 22:57:55 +0530
+Subject: [PATCH] Voice search query plays best match from liked songs
+ (uncompiled draft)
+
+---
+ .../callback/SimpleMediaSessionCallback.kt    | 30 ++++++++++++
+ .../service/callback/VoiceLikedSongMatcher.kt | 27 +++++++++++
+ .../callback/VoiceLikedSongMatcherTest.kt     | 47 +++++++++++++++++++
+ 3 files changed, 104 insertions(+)
+ create mode 100644 media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt
+ create mode 100644 media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt
+
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+index 063e54b..9cfb9b8 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+@@ -555,6 +555,36 @@ internal class SimpleMediaSessionCallback(
+             // Play from Android Auto
+             val defaultResult =
+                 MediaSession.MediaItemsWithStartPosition(emptyList(), startIndex, startPositionMs)
++            // Voice request (e.g. Google Assistant): an item with only a search query. Play the best
++            // title match from the liked songs. No match: do nothing (no online fallback here).
++            val voiceQuery =
++                mediaItems
++                    .firstOrNull()
++                    ?.takeIf { it.mediaId.isBlank() || it.mediaId == MediaItem.DEFAULT_MEDIA_ID }
++                    ?.requestMetadata
++                    ?.searchQuery
++                    ?.trim()
++                    ?.takeIf { it.isNotEmpty() }
++            if (voiceQuery != null) {
++                val likedSongs = songRepository.getLikedSongs().first()
++                // Ambiguous or unknown queries no-op: never surprise-play the wrong song.
++                val matchIndex =
++                    VoiceLikedSongMatcher.resolve(voiceQuery, likedSongs.map { it.title })
++                        ?: return@future defaultResult
++                val matched = likedSongs[matchIndex].toTrack()
++                mediaPlayerHandler.setQueueData(
++                    QueueData.Data(
++                        listTracks = likedSongs.toArrayListTrack(),
++                        firstPlayedTrack = matched,
++                        playlistId = null,
++                        playlistName = context.getString(R.string.favorites),
++                        playlistType = PlaylistType.LOCAL_PLAYLIST,
++                        continuation = null,
++                    ),
++                )
++                mediaPlayerHandler.loadMediaItem(matched, Config.PLAYLIST_CLICK, matchIndex)
++                return@future defaultResult
++            }
+             val path =
+                 mediaItems.firstOrNull()?.mediaId?.split("/")
+                     ?: return@future defaultResult
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt
+new file mode 100644
+index 0000000..7c246c5
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt
+@@ -0,0 +1,27 @@
++package com.maxrave.media3.service.callback
++
++/**
++ * Resolves a spoken search query (for example from Google Assistant / Gemini) to a liked-song
++ * index. Pure Kotlin so it is unit-testable on the JVM.
++ *
++ * Rules: strip a trailing "from/in/on (my) liked/favourite(s) (songs)" qualifier; an empty
++ * remainder never plays; an exact title match (case-insensitive) wins; otherwise a single
++ * "contains" match plays; several possible matches are ambiguous and return null so nothing
++ * unexpected starts playing.
++ */
++internal object VoiceLikedSongMatcher {
++    private val qualifier =
++        Regex("(?i)\\s+(from|in|on)\\s+(my\\s+)?(liked|favou?rite)s?( songs)?\\s*$")
++
++    fun resolve(
++        query: String,
++        titles: List<String>,
++    ): Int? {
++        val wanted = query.trim().replace(qualifier, "").trim().lowercase()
++        if (wanted.isEmpty()) return null
++        val exact = titles.indexOfFirst { it.lowercase() == wanted }
++        if (exact >= 0) return exact
++        val contains = titles.withIndex().filter { it.value.lowercase().contains(wanted) }
++        return if (contains.size == 1) contains.first().index else null
++    }
++}
+diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt
+new file mode 100644
+index 0000000..4e027af
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt
+@@ -0,0 +1,47 @@
++package com.maxrave.media3.service.callback
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class VoiceLikedSongMatcherTest {
++    private val titles = listOf("Royalty", "Night Changes", "Royalty Free Beats", "Royals")
++
++    @Test
++    fun exactTitlePlays() {
++        assertEquals(0, VoiceLikedSongMatcher.resolve("Royalty", titles))
++    }
++
++    @Test
++    fun likedSongsQualifierIsStripped() {
++        assertEquals(0, VoiceLikedSongMatcher.resolve("Royalty from liked songs", titles))
++        assertEquals(0, VoiceLikedSongMatcher.resolve("Royalty in my favourites", titles))
++        assertEquals(0, VoiceLikedSongMatcher.resolve("Royalty on favorites", titles))
++    }
++
++    @Test
++    fun matchingIsCaseInsensitive() {
++        assertEquals(1, VoiceLikedSongMatcher.resolve("night changes from liked songs", titles))
++    }
++
++    @Test
++    fun bareLikedSongsRequestDoesNotPlay() {
++        assertNull(VoiceLikedSongMatcher.resolve("play from liked songs", titles))
++        assertNull(VoiceLikedSongMatcher.resolve("liked songs", titles))
++    }
++
++    @Test
++    fun ambiguousQueryDoesNotPlay() {
++        assertNull(VoiceLikedSongMatcher.resolve("royal", titles))
++    }
++
++    @Test
++    fun uniquePartialMatchPlays() {
++        assertEquals(1, VoiceLikedSongMatcher.resolve("changes", titles))
++    }
++
++    @Test
++    fun unknownSongDoesNotPlay() {
++        assertNull(VoiceLikedSongMatcher.resolve("unknown track from liked songs", titles))
++    }
++}
+-- 
+2.34.1
+
