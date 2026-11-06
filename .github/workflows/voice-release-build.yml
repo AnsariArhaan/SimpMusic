@@ -19,6 +19,17 @@ jobs:
       - name: Apply voice liked-songs patch to core submodule
         run: git -C core apply ../patches/voice-liked-search.patch
 
+      - name: Apply voice wake-word listener patch to core submodule
+        run: git -C core apply ../patches/voice-wakeword-listener.patch
+
+      - name: Fetch offline speech model (sha256-verified)
+        run: |
+          curl -fsSL "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" -o "$RUNNER_TEMP/vosk-model.zip"
+          echo "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498  $RUNNER_TEMP/vosk-model.zip" | sha256sum -c -
+          mkdir -p core/media/media3/src/main/assets/model-en-us
+          unzip -q "$RUNNER_TEMP/vosk-model.zip" -d "$RUNNER_TEMP/vosk-model"
+          cp -r "$RUNNER_TEMP/vosk-model/vosk-model-small-en-us-0.15/." core/media/media3/src/main/assets/model-en-us/
+
       - name: Set up JDK 21
         uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:

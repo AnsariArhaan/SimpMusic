@@ -1,0 +1,501 @@
+diff --git a/media/media3/build.gradle.kts b/media/media3/build.gradle.kts
+index 0321cb0..468145f 100644
+--- a/media/media3/build.gradle.kts
++++ b/media/media3/build.gradle.kts
+@@ -74,6 +74,9 @@ dependencies {
+     implementation(libs.okhttp3.logging.interceptor)
+     implementation(libs.coroutines.guava)
+ 
++    // Offline wake-word/command recognizer (fork voice listener); Apache-2.0, no account/key
++    implementation("com.alphacephei:vosk-android:0.3.75")
++
+     // Android Auto (Car App Library media templates)
+     implementation(libs.car.app.core)
+     implementation(libs.car.app.projected)
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
+new file mode 100644
+index 0000000..9863a2e
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
+@@ -0,0 +1,22 @@
++package com.maxrave.media3.voice
++
++/**
++ * Turns what the offline recognizer heard into a search query for [VoiceLikedSongMatcher] via the
++ * media session. Pure Kotlin so it is unit-testable on the JVM.
++ *
++ * The recognizer hears the wake phrase and command as one stream, for example
++ * "hey ben play royalty". The wake phrase and the leading verb are stripped here; the liked-song
++ * qualifier ("from liked songs") is stripped by VoiceLikedSongMatcher itself. An empty remainder
++ * means the user said only the wake phrase, so nothing plays.
++ */
++internal object VoiceCommandParser {
++    const val WAKE_PHRASE = "hey ben"
++
++    private val wakePrefix = Regex("(?i)^\\s*hey\\s+ben\\b[,.!?]?\\s*")
++    private val leadIn =
++        Regex("(?i)^(?:(?:please|plz)\\s+)?(?:(?:play|put on|sunao|bajao|chala(?:o| do)?|start)\\s+)?")
++
++    fun isWake(text: String): Boolean = text.lowercase().contains(WAKE_PHRASE)
++
++    fun commandFrom(text: String): String = text.trim().replace(wakePrefix, "").replace(leadIn, "").trim()
++}
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+new file mode 100644
+index 0000000..5b7c140
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -0,0 +1,399 @@
++package com.maxrave.media3.voice
++
++import android.Manifest
++import android.annotation.SuppressLint
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.app.Service
++import android.content.ComponentName
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.content.pm.ServiceInfo
++import android.media.AudioManager
++import android.media.ToneGenerator
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import android.os.PowerManager
++import androidx.core.app.NotificationCompat
++import androidx.core.app.ServiceCompat
++import androidx.core.content.ContextCompat
++import androidx.media3.common.MediaItem
++import androidx.media3.common.MediaMetadata
++import androidx.media3.session.MediaController
++import androidx.media3.session.SessionToken
++import com.maxrave.logger.Logger
++import com.maxrave.media3.service.SimpleMediaService
++import kotlinx.coroutines.flow.MutableStateFlow
++import org.json.JSONObject
++import org.vosk.Model
++import org.vosk.Recognizer
++import org.vosk.android.RecognitionListener
++import org.vosk.android.SpeechService
++import org.vosk.android.StorageService
++
++/**
++ * Fork-added offline "Hey Ben" voice listener. User-started and user-stopped only.
++ *
++ * A microphone-type foreground service: while it runs the system shows a mic indicator and a
++ * persistent notification with a Stop action. Everything is on-device (Vosk, no account, no
++ * network): a grammar recognizer waits for the wake phrase, then a free-form recognizer captures
++ * one command, the text goes through the same media-session searchQuery path Google Assistant
++ * would use, and SimpleMediaSessionCallback plays the matched liked song (or nothing).
++ *
++ * Stock-Android limits disclosed to the user: it does not restart itself after a reboot or a
++ * service kill - re-enable from Settings. Continuous decoding costs battery; the partial wake lock
++ * is what keeps listening alive on a locked screen.
++ */
++class VoiceListenService : Service(), RecognitionListener {
++    companion object {
++        const val ACTION_START = "com.maxrave.media3.voice.START"
++        const val ACTION_STOP = "com.maxrave.media3.voice.STOP"
++
++        private const val TAG = "VoiceListenService"
++        private const val CHANNEL_ID = "voice_listen"
++        private const val NOTIFICATION_ID = 4242
++        private const val COMMAND_TIMEOUT_MS = 6000L
++        private const val DUCK_VOLUME = 0.25f
++
++        /** UI switch state: true only while the service is actually running. */
++        val running = MutableStateFlow(false)
++
++        fun startIntent(context: Context): Intent = Intent(context, VoiceListenService::class.java).setAction(ACTION_START)
++
++        fun stopIntent(context: Context): Intent = Intent(context, VoiceListenService::class.java).setAction(ACTION_STOP)
++    }
++
++    private enum class Stage { LOADING, WAKE, COMMAND }
++
++    private var stage = Stage.LOADING
++    private var model: Model? = null
++    private var speechService: SpeechService? = null
++    private var wakeLock: PowerManager.WakeLock? = null
++    private var controller: MediaController? = null
++    private var duckedVolume: Float? = null
++    private var lastCommandPartial = ""
++    private val handler = Handler(Looper.getMainLooper())
++    private var stopping = false
++
++    private val commandTimeout =
++        Runnable {
++            if (stage == Stage.COMMAND) finishCommandStage(lastCommandPartial)
++        }
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(
++        intent: Intent?,
++        flags: Int,
++        startId: Int,
++    ): Int {
++        when (intent?.action) {
++            ACTION_STOP -> {
++                shutdown()
++                return START_NOT_STICKY
++            }
++            ACTION_START -> {
++                if (running.value) return START_STICKY
++                if (
++                    ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
++                    PackageManager.PERMISSION_GRANTED
++                ) {
++                    Logger.w(TAG, "start refused: RECORD_AUDIO not granted")
++                    shutdown()
++                    return START_NOT_STICKY
++                }
++                startForegroundWithNotification()
++                acquireWakeLock()
++                running.value = true
++                loadModel()
++                return START_STICKY
++            }
++            else -> return START_NOT_STICKY
++        }
++    }
++
++    private fun startForegroundWithNotification() {
++        val nm = getSystemService(NotificationManager::class.java)
++        nm.createNotificationChannel(
++            NotificationChannel(CHANNEL_ID, "Voice listening", NotificationManager.IMPORTANCE_LOW),
++        )
++        val stopPending =
++            PendingIntent.getService(
++                this,
++                0,
++                stopIntent(this),
++                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
++            )
++        val notification: Notification =
++            NotificationCompat
++                .Builder(this, CHANNEL_ID)
++                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
++                .setContentTitle("Voice listening on")
++                .setContentText("Say \"Hey Ben\", then \"play Royalty\"")
++                .setOngoing(true)
++                .addAction(0, "Stop", stopPending)
++                .build()
++        ServiceCompat.startForeground(
++            this,
++            NOTIFICATION_ID,
++            notification,
++            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
++        )
++    }
++
++    @SuppressLint("WakelockTimeout")
++    private fun acquireWakeLock() {
++        val pm = getSystemService(PowerManager::class.java)
++        wakeLock =
++            pm
++                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "simpmusic:voiceListen")
++                .apply { acquire() }
++    }
++
++    private fun loadModel() {
++        stage = Stage.LOADING
++        StorageService.unpack(
++            this,
++            "model-en-us",
++            "voice-model",
++            { unpacked ->
++                model = unpacked
++                enterWakeStage()
++            },
++            { error ->
++                Logger.e(TAG, "model unpack failed: ${error.message}")
++                shutdown()
++            },
++        )
++    }
++
++    private fun enterWakeStage() {
++        if (stopping) return
++        releaseSpeech()
++        val m = model ?: return
++        stage = Stage.WAKE
++        lastCommandPartial = ""
++        val grammar = "[\"${VoiceCommandParser.WAKE_PHRASE}\", \"[unk]\"]"
++        val recognizer = Recognizer(m, 16000.0f, grammar)
++        speechService =
++            SpeechService(recognizer, 16000.0f).also {
++                it.startListening(this)
++            }
++        Logger.w(TAG, "wake stage listening")
++    }
++
++    private fun enterCommandStage() {
++        if (stopping) return
++        val m = model ?: return
++        stage = Stage.COMMAND
++        lastCommandPartial = ""
++        releaseSpeech()
++        signalListening()
++        duckPlayback()
++        val recognizer = Recognizer(m, 16000.0f)
++        speechService =
++            SpeechService(recognizer, 16000.0f).also {
++                it.startListening(this)
++            }
++        handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
++        Logger.w(TAG, "command stage listening")
++    }
++
++    private fun finishCommandStage(rawText: String) {
++        if (stage != Stage.COMMAND) return
++        handler.removeCallbacks(commandTimeout)
++        restorePlayback()
++        val query = VoiceCommandParser.commandFrom(rawText)
++        Logger.w(TAG, "command heard: '$rawText' -> query '$query'")
++        if (query.isNotEmpty()) playLikedQuery(query)
++        enterWakeStage()
++    }
++
++    private fun playLikedQuery(query: String) {
++        val metadata =
++            MediaMetadata
++                .Builder()
++                .setSearchQuery(query)
++                .build()
++        val item =
++            MediaItem
++                .Builder()
++                .setMediaId(MediaItem.DEFAULT_MEDIA_ID)
++                .setRequestMetadata(
++                    MediaItem.RequestMetadata
++                        .Builder()
++                        .setSearchQuery(query)
++                        .build(),
++                ).setMediaMetadata(metadata)
++                .build()
++        withController { c ->
++            c.setMediaItem(item)
++            c.prepare()
++            c.play()
++        }
++    }
++
++    private fun duckPlayback() {
++        withController { c ->
++            if (c.isPlaying) {
++                duckedVolume = c.volume
++                c.volume = DUCK_VOLUME
++            }
++        }
++    }
++
++    private fun restorePlayback() {
++        val back = duckedVolume ?: return
++        duckedVolume = null
++        withController { c -> c.volume = back }
++    }
++
++    /** Connects (once) to the app's media session and runs [block] when the controller is ready. */
++    private fun withController(block: (MediaController) -> Unit) {
++        controller?.let {
++            block(it)
++            return
++        }
++        val future =
++            MediaController
++                .Builder(this, SessionToken(this, ComponentName(this, SimpleMediaService::class.java)))
++                .buildAsync()
++        future.addListener(
++            {
++                try {
++                    val c = future.get()
++                    controller = c
++                    block(c)
++                } catch (e: Exception) {
++                    Logger.e(TAG, "media controller connect failed: ${e.message}")
++                }
++            },
++            ContextCompat.getMainExecutor(this),
++        )
++    }
++
++    private fun signalListening() {
++        try {
++            ToneGenerator(AudioManager.STREAM_MUSIC, 70).apply {
++                startTone(ToneGenerator.TONE_PROP_ACK, 200)
++                handler.postDelayed({ release() }, 400)
++            }
++        } catch (e: Exception) {
++            Logger.w(TAG, "beep failed: ${e.message}")
++        }
++    }
++
++    // RecognitionListener (both stages share it; behavior branches on stage)
++
++    override fun onPartialResult(hypothesis: String?) {
++        val text = extractText(hypothesis, "partial")
++        when (stage) {
++            Stage.WAKE -> if (VoiceCommandParser.isWake(text)) enterCommandStage()
++            Stage.COMMAND -> if (text.isNotEmpty()) lastCommandPartial = text
++            else -> {}
++        }
++    }
++
++    override fun onResult(hypothesis: String?) {
++        if (stage == Stage.COMMAND) {
++            val text = extractText(hypothesis, "text")
++            if (text.isNotEmpty()) finishCommandStage(text)
++        }
++    }
++
++    override fun onFinalResult(hypothesis: String?) {
++        if (stage == Stage.COMMAND) {
++            val text = extractText(hypothesis, "text")
++            finishCommandStage(if (text.isNotEmpty()) text else lastCommandPartial)
++        }
++    }
++
++    override fun onError(exception: Exception?) {
++        Logger.e(TAG, "recognizer error: ${exception?.message}")
++        if (!stopping && stage != Stage.LOADING) enterWakeStage()
++    }
++
++    override fun onTimeout() {
++        if (!stopping && stage != Stage.LOADING) enterWakeStage()
++    }
++
++    private fun extractText(
++        json: String?,
++        key: String,
++    ): String =
++        try {
++            JSONObject(json ?: "").optString(key, "")
++        } catch (e: Exception) {
++            ""
++        }
++
++    private fun releaseSpeech() {
++        handler.removeCallbacks(commandTimeout)
++        try {
++            speechService?.stop()
++            speechService?.shutdown()
++        } catch (e: Exception) {
++            Logger.w(TAG, "speech release: ${e.message}")
++        }
++        speechService = null
++    }
++
++    private fun shutdown() {
++        if (stopping) return
++        stopping = true
++        restorePlayback()
++        releaseSpeech()
++        try {
++            model?.close()
++        } catch (e: Exception) {
++            Logger.w(TAG, "model close: ${e.message}")
++        }
++        model = null
++        try {
++            controller?.release()
++        } catch (e: Exception) {
++            Logger.w(TAG, "controller release: ${e.message}")
++        }
++        controller = null
++        try {
++            wakeLock?.takeIf { it.isHeld }?.release()
++        } catch (e: Exception) {
++            Logger.w(TAG, "wakelock release: ${e.message}")
++        }
++        wakeLock = null
++        running.value = false
++        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
++        stopSelf()
++    }
++
++    override fun onDestroy() {
++        if (!stopping) {
++            stopping = true
++            releaseSpeech()
++            try {
++                model?.close()
++            } catch (e: Exception) {
++                Logger.w(TAG, "model close: ${e.message}")
++            }
++            model = null
++            try {
++                controller?.release()
++            } catch (e: Exception) {
++                Logger.w(TAG, "controller release: ${e.message}")
++            }
++            controller = null
++            try {
++                wakeLock?.takeIf { it.isHeld }?.release()
++            } catch (e: Exception) {
++                Logger.w(TAG, "wakelock release: ${e.message}")
++            }
++            wakeLock = null
++            running.value = false
++        }
++        super.onDestroy()
++    }
++}
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt
+new file mode 100644
+index 0000000..7df7233
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt
+@@ -0,0 +1,48 @@
++package com.maxrave.media3.voice
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class VoiceCommandParserTest {
++    @Test
++    fun wakeDetection() {
++        assertTrue(VoiceCommandParser.isWake("hey ben"))
++        assertTrue(VoiceCommandParser.isWake("Hey Ben play something"))
++        assertFalse(VoiceCommandParser.isWake("play ben e king"))
++        assertFalse(VoiceCommandParser.isWake(""))
++    }
++
++    @Test
++    fun stripsWakeAndVerb() {
++        assertEquals("royalty", VoiceCommandParser.commandFrom("hey ben play royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("Hey Ben, play royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("hey ben please play royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("hey ben royalty"))
++    }
++
++    @Test
++    fun keepsLikedSongsQualifierForMatcher() {
++        assertEquals(
++            "royalty from liked songs",
++            VoiceCommandParser.commandFrom("hey ben play royalty from liked songs"),
++        )
++    }
++
++    @Test
++    fun wakeOnlyIsEmpty() {
++        assertEquals("", VoiceCommandParser.commandFrom("hey ben"))
++        assertEquals("", VoiceCommandParser.commandFrom("  hey ben  "))
++    }
++
++    @Test
++    fun noWakeKeepsWholeUtterance() {
++        assertEquals("royalty", VoiceCommandParser.commandFrom("royalty"))
++    }
++
++    @Test
++    fun doesNotStripPlayInsideTitle() {
++        assertEquals("play date", VoiceCommandParser.commandFrom("hey ben play play date"))
++    }
++}

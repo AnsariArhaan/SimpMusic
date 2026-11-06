@@ -47,3 +47,6 @@ sentry.properties
 /desktopApp/generated.conveyor.conf
 # Conveyor output directory
 /output/
+
+# CI-fetched offline speech model (sha256-verified in voice-release-build.yml)
+core/media/media3/src/main/assets/model-en-us/

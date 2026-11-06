@@ -110,6 +110,7 @@ import com.maxrave.domain.repository.ImportProgress
 import com.maxrave.domain.utils.LocalResource
 import com.maxrave.logger.Logger
 import com.maxrave.simpmusic.Platform
+import com.maxrave.simpmusic.expect.ui.VoiceListeningSettingGroup
 import com.maxrave.simpmusic.expect.ui.LoginSyncDialog
 import com.maxrave.simpmusic.expect.ui.filePickerResult
 import com.maxrave.simpmusic.expect.ui.fileSaverResult
@@ -2104,6 +2105,9 @@ fun SettingScreen(
                     switch = (amAnimatedArtwork to { viewModel.setAMAnimatedArtwork(it) }),
                 )
             }
+        }
+        item(key = "voiceListening") {
+            VoiceListeningSettingGroup()
         }
         item(key = "discord") {
             SettingGroup(title = stringResource(Res.string.discord_integration)) {
