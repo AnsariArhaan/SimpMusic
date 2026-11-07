@@ -1,0 +1,448 @@
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceKeywordWake.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceKeywordWake.kt
+index 6025a5c..695190a 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceKeywordWake.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceKeywordWake.kt
+@@ -3,8 +3,12 @@ package com.maxrave.media3.voice
+ import android.annotation.SuppressLint
+ import android.content.res.AssetManager
+ import android.media.AudioFormat
++import android.media.AudioManager
++import android.media.AudioRecordingConfiguration
+ import android.media.AudioRecord
+ import android.media.MediaRecorder
++import android.os.Build
++import android.os.SystemClock
+ import com.k2fsa.sherpa.onnx.FeatureConfig
+ import com.k2fsa.sherpa.onnx.KeywordSpotter
+ import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
+@@ -23,6 +27,7 @@ import com.maxrave.logger.Logger
+  */
+ internal class VoiceKeywordWake(
+     private val spotter: KeywordSpotter,
++    private val health: VoiceMicHealth? = null,
+ ) {
+     @Volatile private var running = false
+     private var thread: Thread? = null
+@@ -60,10 +65,12 @@ internal class VoiceKeywordWake(
+         onFault: (String) -> Unit,
+     ) {
+         var record: AudioRecord? = null
++        var callback: AudioManager.AudioRecordingCallback? = null
+         var stream: com.k2fsa.sherpa.onnx.OnlineStream? = null
+         try {
+             val min = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+             if (min <= 0) {
++                health?.onFault("audio buffer size $min")
+                 onFault("audio buffer size $min")
+                 return
+             }
+@@ -76,16 +83,22 @@ internal class VoiceKeywordWake(
+                     maxOf(min, SAMPLE_RATE),
+                 )
+             if (record.state != AudioRecord.STATE_INITIALIZED) {
++                health?.onFault("microphone not available")
+                 onFault("microphone not available")
+                 return
+             }
+             stream = spotter.createStream()
++            health?.onRecorderCreated()
++            // Must be registered before startRecording (Android docs, "Sharing audio input").
++            callback = health?.let { registerHealthCallback(record, it) }
+             record.startRecording()
++            var reads = 0
+             val shorts = ShortArray(CHUNK)
+             val floats = FloatArray(CHUNK)
+             while (running) {
+                 val n = record.read(shorts, 0, CHUNK)
+                 if (n < 0) {
++                    health?.onFault("audio read error $n")
+                     onFault("audio read error $n")
+                     return
+                 }
+@@ -93,6 +106,10 @@ internal class VoiceKeywordWake(
+                     Thread.sleep(10)
+                     continue
+                 }
++                if (health != null) {
++                    health.onFrame(VoiceMicHealth.peakOf(shorts, n), SystemClock.elapsedRealtime())
++                    if (reads++ % 10 == 0) pollHealth(record, health)
++                }
+                 toFloats(shorts, n, floats)
+                 stream.acceptWaveform(if (n == CHUNK) floats else floats.copyOf(n), SAMPLE_RATE)
+                 while (running && spotter.isReady(stream)) {
+@@ -109,9 +126,14 @@ internal class VoiceKeywordWake(
+                 }
+             }
+         } catch (e: Throwable) {
++            health?.onFault("keyword listener failed: ${e.message}")
+             Logger.e(TAG, "keyword listener failed: ${e.message}")
+             onFault("keyword listener failed: ${e.message}")
+         } finally {
++            try {
++                callback?.let { record?.unregisterAudioRecordingCallback(it) }
++            } catch (_: Exception) {
++            }
+             try {
+                 record?.stop()
+             } catch (_: Exception) {
+@@ -127,6 +149,47 @@ internal class VoiceKeywordWake(
+         }
+     }
+ 
++    /** Reads what Android says about this recorder (API 29+). Diagnostic only. */
++    @SuppressLint("NewApi")
++    private fun registerHealthCallback(
++        record: AudioRecord,
++        health: VoiceMicHealth,
++    ): AudioManager.AudioRecordingCallback? {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
++        return try {
++            val cb =
++                object : AudioManager.AudioRecordingCallback() {
++                    override fun onRecordingConfigChanged(configs: MutableList<AudioRecordingConfiguration>?) {
++                        configs?.firstOrNull { it.clientAudioSessionId == record.audioSessionId }?.let {
++                            health.onSilenced(it.isClientSilenced)
++                            health.onDevice(it.audioDevice?.type)
++                        }
++                    }
++                }
++            record.registerAudioRecordingCallback({ it.run() }, cb)
++            cb
++        } catch (e: Throwable) {
++            Logger.w(TAG, "recording callback unavailable: ${e.message}")
++            null
++        }
++    }
++
++    @SuppressLint("NewApi")
++    private fun pollHealth(
++        record: AudioRecord,
++        health: VoiceMicHealth,
++    ) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
++        try {
++            record.activeRecordingConfiguration?.let {
++                health.onSilenced(it.isClientSilenced)
++                health.onDevice(it.audioDevice?.type)
++            }
++            health.onDevice(record.routedDevice?.type)
++        } catch (_: Throwable) {
++        }
++    }
++
+     companion object {
+         private const val TAG = "VoiceKeywordWake"
+         const val SAMPLE_RATE = 16000
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index c51d4ff..baed475 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -62,6 +62,7 @@ class VoiceListenService : Service() {
+         private const val COMMAND_START_DELAY_MS = 350L
+         private const val OUTCOME_TIMEOUT_MS = 20000L
+         private const val WAKE_COOLDOWN_MS = 1500L
++        private const val HEALTH_TICK_MS = 3000L
+         private const val END_SILENCE_S = 1.2f
+         private const val MAX_UTTERANCE_S = 15.0f
+         private const val COMMAND_LANG = "en-IN"
+@@ -83,6 +84,7 @@ class VoiceListenService : Service() {
+     private var speechService: SpeechService? = null
+     private var spotter: com.k2fsa.sherpa.onnx.KeywordSpotter? = null
+     private var kwsWake: VoiceKeywordWake? = null
++    private val micHealth = VoiceMicHealth()
+     private var wakeLock: PowerManager.WakeLock? = null
+     private var controller: MediaController? = null
+     private var pausedByUs = false
+@@ -406,7 +408,8 @@ class VoiceListenService : Service() {
+         stage = Stage.WAKE
+         lastCommandPartial = ""
+         val myGen = gen
+-        val wake = VoiceKeywordWake(sp)
++        val wake = VoiceKeywordWake(sp, micHealth)
++        micHealth.onWakeStart()
+         kwsWake = wake
+         wake.start(
+             onDetect = { keyword, tokens, times -> handler.post { onKeywordDetected(myGen, keyword, tokens, times) } },
+@@ -415,6 +418,8 @@ class VoiceListenService : Service() {
+         // True only here: engine loaded and the wake listener thread is started.
+         running.value = true
+         Logger.w(TAG, "wake stage listening (sherpa keyword spotter)")
++        handler.removeCallbacks(healthTick)
++        handler.post(healthTick)
+     }
+ 
+     private fun onKeywordDetected(
+@@ -436,6 +441,7 @@ class VoiceListenService : Service() {
+     ) {
+         if (stopping || myGen != gen || stage != Stage.WAKE) return
+         Logger.e(TAG, "wake listener fault: $reason")
++        micHealth.onFault(reason)
+         handleRecognizerFault("wake listener ($reason)")
+     }
+ 
+@@ -658,6 +664,36 @@ class VoiceListenService : Service() {
+      * Diagnostic: the latest wake-stage result stays in its own notification that no other status
+      * overwrites. Text only; nothing recorded or sent anywhere. Replaced by the next wake-like result.
+      */
++    /** Diagnostic only: a separate notification with the real microphone state, refreshed every few seconds. */
++    private val healthTick =
++        object : Runnable {
++            override fun run() {
++                if (stopping) return
++                try {
++                    val text =
++                        micHealth.report(
++                            stage.name.lowercase(),
++                            stage == Stage.WAKE,
++                            SystemClock.elapsedRealtime(),
++                        )
++                    val n =
++                        NotificationCompat
++                            .Builder(this@VoiceListenService, CHANNEL_ID)
++                            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
++                            .setContentTitle("Mic health (diagnostic)")
++                            .setContentText(text.lineSequence().drop(1).firstOrNull() ?: text)
++                            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
++                            .setOnlyAlertOnce(true)
++                            .setOngoing(true)
++                            .build()
++                    getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID + 2, n)
++                } catch (e: Exception) {
++                    Logger.w(TAG, "mic health notify failed: ${e.message}")
++                }
++                handler.postDelayed(this, HEALTH_TICK_MS)
++            }
++        }
++
+     private fun showLastWakeCheck(text: String) {
+         Logger.w(TAG, "last wake check: $text")
+         handler.post {
+@@ -768,11 +804,20 @@ class VoiceListenService : Service() {
+         androidRecognizer = null
+     }
+ 
++    private fun cancelHealthNotification() {
++        try {
++            getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID + 2)
++        } catch (_: Exception) {
++        }
++    }
++
+     private fun shutdown() {
+         if (stopping) return
+         stopping = true
+         VoiceDiagnostics.sink = null
+         handler.removeCallbacks(outcomeTimeout)
++        handler.removeCallbacks(healthTick)
++        cancelHealthNotification()
+         releaseSpeech()
+         try {
+             spotter?.release()
+@@ -808,6 +853,8 @@ class VoiceListenService : Service() {
+             stopping = true
+             VoiceDiagnostics.sink = null
+             handler.removeCallbacks(outcomeTimeout)
++            handler.removeCallbacks(healthTick)
++            cancelHealthNotification()
+             releaseSpeech()
+             try {
+                 spotter?.release()
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceMicHealth.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceMicHealth.kt
+new file mode 100644
+index 0000000..a694144
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceMicHealth.kt
+@@ -0,0 +1,121 @@
++package com.maxrave.media3.voice
++
++/**
++ * Diagnostic only. Collects what the wake listener's microphone is actually doing so the on-screen
++ * status does not rely on "listening ON" alone. It never changes behaviour: no retries, no restarts.
++ * Numbers only, no audio is kept.
++ */
++internal class VoiceMicHealth {
++    private val lock = Any()
++    private val frames = ArrayDeque<Pair<Long, Int>>() // (time ms, peak of that read)
++    private var silenced: Boolean? = null
++    private var deviceType: Int? = null
++    private var wakeStarts = 0
++    private var lastFault: String? = null
++
++    fun onWakeStart() {
++        synchronized(lock) { wakeStarts += 1 }
++    }
++
++    fun onFrame(
++        peak: Int,
++        nowMs: Long,
++    ) {
++        synchronized(lock) {
++            frames.addLast(nowMs to peak)
++            prune(nowMs)
++        }
++    }
++
++    /** Null means Android has not told us. */
++    fun onSilenced(value: Boolean?) {
++        synchronized(lock) {
++            if (value != null) silenced = value
++        }
++    }
++
++    fun onDevice(type: Int?) {
++        synchronized(lock) {
++            if (type != null) deviceType = type
++        }
++    }
++
++    fun onFault(reason: String) {
++        synchronized(lock) { lastFault = reason }
++    }
++
++    /** A new AudioRecord starts with no knowledge of the previous one. */
++    fun onRecorderCreated() {
++        synchronized(lock) {
++            silenced = null
++            deviceType = null
++        }
++    }
++
++    private fun prune(nowMs: Long) {
++        while (frames.isNotEmpty() && nowMs - frames.first().first > WINDOW_MS) frames.removeFirst()
++    }
++
++    fun report(
++        stageName: String,
++        wakeListenerRunning: Boolean,
++        nowMs: Long,
++    ): String =
++        synchronized(lock) {
++            prune(nowMs)
++            val n = frames.size
++            val peak = frames.maxOfOrNull { it.second } ?: 0
++            val audio =
++                when {
++                    !wakeListenerRunning -> "Wake microphone is paused in this stage"
++                    n == 0 -> "No audio reads in the last 5 s"
++                    peak == 0 -> "Audio reads in last 5 s: $n, every sample was zero"
++                    else -> "Audio reads in last 5 s: $n, loudest sample $peak of 32767"
++                }
++            val sil =
++                when (silenced) {
++                    true -> "Android reports the capture is silenced (cause not identified)"
++                    false -> "Android reports the capture is not silenced"
++                    null -> "Silence state: not reported by Android"
++                }
++            buildString {
++                append("Stage: ").append(stageName).append(", wake listener starts since ON: ").append(wakeStarts).append('\n')
++                append(audio).append('\n')
++                append(sil).append('\n')
++                append("Input device: ").append(deviceName(deviceType))
++                lastFault?.let { append('\n').append("Last wake listener fault: ").append(it) }
++            }
++        }
++
++    companion object {
++        const val WINDOW_MS = 5000L
++
++        fun peakOf(
++            shorts: ShortArray,
++            n: Int,
++        ): Int {
++            var peak = 0
++            for (i in 0 until n) {
++                val v = shorts[i].toInt()
++                val a = if (v < 0) -v else v // -32768 gives 32768, which is fine here
++                if (a > peak) peak = a
++            }
++            return peak
++        }
++
++        /** Names for android.media.AudioDeviceInfo.TYPE_* values (kept numeric so tests run on the JVM). */
++        fun deviceName(type: Int?): String =
++            when (type) {
++                null -> "unknown"
++                15 -> "built-in microphone"
++                7 -> "Bluetooth SCO headset"
++                8 -> "Bluetooth A2DP"
++                26 -> "Bluetooth LE headset"
++                3 -> "wired headset"
++                4 -> "wired headphones"
++                11 -> "USB device"
++                22 -> "USB headset"
++                else -> "other (type $type)"
++            }
++    }
++}
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceMicHealthTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceMicHealthTest.kt
+new file mode 100644
+index 0000000..8686f4f
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceMicHealthTest.kt
+@@ -0,0 +1,66 @@
++package com.maxrave.media3.voice
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class VoiceMicHealthTest {
++    @Test
++    fun peakOfHandlesNegativesAndMinValue() {
++        assertEquals(0, VoiceMicHealth.peakOf(shortArrayOf(0, 0, 0), 3))
++        assertEquals(300, VoiceMicHealth.peakOf(shortArrayOf(10, -300, 200), 3))
++        assertEquals(32768, VoiceMicHealth.peakOf(shortArrayOf(-32768), 1))
++        assertEquals(10, VoiceMicHealth.peakOf(shortArrayOf(10, 9999), 1)) // only n samples count
++    }
++
++    @Test
++    fun noReadsIsReportedAsNoReadsNotAsSilence() {
++        val h = VoiceMicHealth()
++        val r = h.report("wake", true, 10_000)
++        assertTrue(r, r.contains("No audio reads in the last 5 s"))
++        assertTrue(r, r.contains("not reported by Android"))
++    }
++
++    @Test
++    fun zeroSamplesAreReportedAsZeroWithoutNamingACause() {
++        val h = VoiceMicHealth()
++        for (t in 0 until 10) h.onFrame(0, 1_000L + t * 100)
++        val r = h.report("wake", true, 2_000)
++        assertTrue(r, r.contains("10, every sample was zero"))
++        assertTrue(r, !r.contains("muted"))
++    }
++
++    @Test
++    fun oldReadsAgeOutOfTheFiveSecondWindow() {
++        val h = VoiceMicHealth()
++        h.onFrame(5000, 0)
++        h.onFrame(100, 4_000)
++        val r = h.report("wake", true, 6_000)
++        assertTrue(r, r.contains("reads in last 5 s: 1, loudest sample 100"))
++    }
++
++    @Test
++    fun silencedFlagAndDeviceAreShownAsReported() {
++        val h = VoiceMicHealth()
++        h.onSilenced(true)
++        h.onDevice(8)
++        h.onWakeStart()
++        h.onWakeStart()
++        h.onFault("audio read error -3")
++        val r = h.report("wake", true, 0)
++        assertTrue(r, r.contains("silenced (cause not identified)"))
++        assertTrue(r, r.contains("Input device: Bluetooth A2DP"))
++        assertTrue(r, r.contains("starts since ON: 2"))
++        assertTrue(r, r.contains("fault: audio read error -3"))
++        h.onSilenced(null) // unknown does not erase a known value
++        assertTrue(h.report("wake", true, 0).contains("silenced (cause"))
++        h.onRecorderCreated() // a new recorder resets it
++        assertTrue(h.report("wake", true, 0).contains("Silence state: not reported"))
++    }
++
++    @Test
++    fun pausedStageSaysSo() {
++        val r = VoiceMicHealth().report("command", false, 0)
++        assertTrue(r, r.contains("paused in this stage"))
++    }
++}

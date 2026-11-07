@@ -40,6 +40,9 @@ jobs:
       - name: Apply sherpa-onnx keyword-spotter wake patch to core submodule
         run: git -C core apply ../patches/voice-sherpa-wake.patch
 
+      - name: Apply mic health diagnostic patch (callback, stage, frames, peak, input device) to core submodule
+        run: git -C core apply ../patches/voice-mic-health.patch
+
       - name: Fetch sherpa-onnx v2.0.1 Kotlin API, arm64 libs and KWS model (every file sha256-verified)
         run: |
           set -euo pipefail
