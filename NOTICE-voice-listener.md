@@ -1,6 +1,6 @@
 # Voice listener third-party notices (fork addition)
 
-The offline "Hey Ben" voice listener added in this fork (branch arhaan/voice-liked-search,
+The offline "Hey Zora" voice listener added in this fork (branch arhaan/voice-liked-search,
 core changes carried in patches/voice-wakeword-listener.patch) uses:
 
 ## Vosk speech recognition library (com.alphacephei:vosk-android:0.3.75)

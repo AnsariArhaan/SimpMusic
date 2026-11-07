@@ -1075,6 +1075,6 @@
     <string name="recognize_mic_hint">SimpMusic listens for a few seconds to find the song playing near you</string>
     <string name="recognize_allow_mic">Allow microphone</string>
     <string name="voice_listen_section">Voice listening</string>
-    <string name="voice_listen_title">Hands-free listening ("Hey Ben")</string>
-    <string name="voice_listen_subtitle">Keeps the mic on. Say "Hey Ben", then for example "play Royalty" to play a liked song without touching the phone. The listener is offline; playing music still needs internet. Uses more battery. Re-enable after a restart.</string>
+    <string name="voice_listen_title">Hands-free listening ("Hey Zora")</string>
+    <string name="voice_listen_subtitle">Keeps the mic on. Say "Hey Zora", then for example "play Royalty" to play a liked song without touching the phone. The listener is offline; playing music still needs internet. Uses more battery. Re-enable after a restart.</string>
 </resources>

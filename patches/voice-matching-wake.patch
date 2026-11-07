@@ -1,3 +1,13 @@
+diff --git a/media/media3/src/main/assets/voice-oss-notices.txt b/media/media3/src/main/assets/voice-oss-notices.txt
+index 55ee575..c8802b0 100644
+--- a/media/media3/src/main/assets/voice-oss-notices.txt
++++ b/media/media3/src/main/assets/voice-oss-notices.txt
+@@ -1,4 +1,4 @@
+-OPEN-SOURCE NOTICES - "Hey Ben" offline voice listener (SimpMusic fork addition)
++OPEN-SOURCE NOTICES - "Hey Zora" offline voice listener (SimpMusic fork addition)
+ 
+ This application includes the following third-party components for the offline
+ voice listener feature. Both are licensed under the Apache License, Version 2.0;
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
 index db9929f..3677d05 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
@@ -197,10 +207,50 @@ index b8bed9b..8ee769a 100644
 +        }
 +    }
  }
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
+index ec233bf..0b858a9 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
+@@ -5,14 +5,14 @@ package com.maxrave.media3.voice
+  * media session. Pure Kotlin so it is unit-testable on the JVM.
+  *
+  * The recognizer hears the wake phrase and command as one stream, for example
+- * "hey ben play royalty". The wake phrase and the leading verb are stripped here; the liked-song
++ * "hey zora play royalty". The wake phrase and the leading verb are stripped here; the liked-song
+  * qualifier ("from liked songs") is stripped by VoiceLikedSongMatcher itself. An empty remainder
+  * means the user said only the wake phrase, so nothing plays.
+  */
+ internal object VoiceCommandParser {
+-    const val WAKE_PHRASE = "hey ben"
++    const val WAKE_PHRASE = "hey zora"
+ 
+-    private val wakePrefix = Regex("(?i)^\\s*hey\\s+ben\\b[,.!?]?\\s*")
++    private val wakePrefix = Regex("(?i)^\\s*hey\\s+zora\\b[,.!?]?\\s*")
+     private val leadIn =
+         Regex("(?i)^(?:(?:please|plz)\\s+)?(?:(?:play|put on|sunao|bajao|chala(?:o| do)?|start)\\s+)?")
+ 
 diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
-index 1fc027c..d72fe21 100644
+index 1fc027c..3c815a8 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -38,7 +38,7 @@ import org.vosk.android.SpeechService
+ import org.vosk.android.StorageService
+ 
+ /**
+- * Fork-added offline "Hey Ben" voice listener. User-started and user-stopped only.
++ * Fork-added offline "Hey Zora" voice listener. User-started and user-stopped only.
+  *
+  * A microphone-type foreground service: while it runs the system shows a mic indicator and a
+  * persistent notification with a Stop action. Everything is on-device (Vosk, no account, no
+@@ -335,7 +335,7 @@ class VoiceListenService : Service() {
+                 stopIntent(this),
+                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+             )
+-        val notification: Notification = buildNotification("Say \"Hey Ben\", then \"play Royalty\"")
++        val notification: Notification = buildNotification("Say \"Hey Zora\", then \"play Royalty\"")
+         ServiceCompat.startForeground(
+             this,
+             NOTIFICATION_ID,
 @@ -382,6 +382,8 @@ class VoiceListenService : Service() {
          lastCommandPartial = ""
          val grammar = "[\"${VoiceCommandParser.WAKE_PHRASE}\", \"[unk]\"]"
@@ -266,6 +316,19 @@ index 1fc027c..d72fe21 100644
          if (stage == Stage.COMMAND) {
              val text = extractText(hypothesis, "text")
              finishCommandStage(if (text.isNotEmpty()) text else lastCommandPartial)
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt
+index 9e5d1b7..d1e8503 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt
+@@ -9,7 +9,7 @@ internal object VoiceQueryGate {
+     private val unk = Regex("(?i)\\[unk]")
+     private val spaces = Regex("\\s+")
+     private val filler =
+-        setOf("the", "a", "an", "uh", "um", "umm", "hmm", "huh", "oh", "ah", "hey", "ben", "play", "and", "to", "of", "is", "it", "i")
++        setOf("the", "a", "an", "uh", "um", "umm", "hmm", "huh", "oh", "ah", "hey", "ben", "zora", "play", "and", "to", "of", "is", "it", "i")
+     private val cancelPhrases = setOf("cancel", "never mind", "nevermind", "resume", "continue")
+     private const val MAX_WORDS = 12
+ 
 diff --git a/cv/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt
 new file mode 100644
 index 0000000..497dfb0
@@ -403,9 +466,89 @@ index 0000000..8020c83
 +        )
 +    }
 +}
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt
+index 7df7233..3d6cd5b 100644
+--- a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceCommandParserTest.kt
+@@ -8,32 +8,32 @@ import org.junit.Test
+ class VoiceCommandParserTest {
+     @Test
+     fun wakeDetection() {
+-        assertTrue(VoiceCommandParser.isWake("hey ben"))
+-        assertTrue(VoiceCommandParser.isWake("Hey Ben play something"))
++        assertTrue(VoiceCommandParser.isWake("hey zora"))
++        assertTrue(VoiceCommandParser.isWake("Hey Zora play something"))
+         assertFalse(VoiceCommandParser.isWake("play ben e king"))
+         assertFalse(VoiceCommandParser.isWake(""))
+     }
+ 
+     @Test
+     fun stripsWakeAndVerb() {
+-        assertEquals("royalty", VoiceCommandParser.commandFrom("hey ben play royalty"))
+-        assertEquals("royalty", VoiceCommandParser.commandFrom("Hey Ben, play royalty"))
+-        assertEquals("royalty", VoiceCommandParser.commandFrom("hey ben please play royalty"))
+-        assertEquals("royalty", VoiceCommandParser.commandFrom("hey ben royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("hey zora play royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("Hey Zora, play royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("hey zora please play royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("hey zora royalty"))
+     }
+ 
+     @Test
+     fun keepsLikedSongsQualifierForMatcher() {
+         assertEquals(
+             "royalty from liked songs",
+-            VoiceCommandParser.commandFrom("hey ben play royalty from liked songs"),
++            VoiceCommandParser.commandFrom("hey zora play royalty from liked songs"),
+         )
+     }
+ 
+     @Test
+     fun wakeOnlyIsEmpty() {
+-        assertEquals("", VoiceCommandParser.commandFrom("hey ben"))
+-        assertEquals("", VoiceCommandParser.commandFrom("  hey ben  "))
++        assertEquals("", VoiceCommandParser.commandFrom("hey zora"))
++        assertEquals("", VoiceCommandParser.commandFrom("  hey zora  "))
+     }
+ 
+     @Test
+@@ -43,6 +43,6 @@ class VoiceCommandParserTest {
+ 
+     @Test
+     fun doesNotStripPlayInsideTitle() {
+-        assertEquals("play date", VoiceCommandParser.commandFrom("hey ben play play date"))
++        assertEquals("play date", VoiceCommandParser.commandFrom("hey zora play play date"))
+     }
+ }
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
+index e954e5a..14c2597 100644
+--- a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
+@@ -14,7 +14,7 @@ class VoiceQueryGateTest {
+ 
+     @Test
+     fun parserStripsUnknownBeforeWake() {
+-        assertEquals("royalty", VoiceCommandParser.commandFrom("[unk] hey ben play royalty"))
++        assertEquals("royalty", VoiceCommandParser.commandFrom("[unk] hey zora play royalty"))
+         assertEquals("", VoiceCommandParser.commandFrom("[unk]"))
+     }
+ 
+@@ -42,9 +42,9 @@ class VoiceQueryGateTest {
+ 
+     @Test
+     fun wakeOnlyIsStrict() {
+-        assertTrue(VoiceCommandParser.isWakeOnly(" Hey Ben "))
+-        assertFalse(VoiceCommandParser.isWakeOnly("[unk] hey ben"))
+-        assertFalse(VoiceCommandParser.isWakeOnly("hey ben play"))
++        assertTrue(VoiceCommandParser.isWakeOnly(" Hey Zora "))
++        assertFalse(VoiceCommandParser.isWakeOnly("[unk] hey zora"))
++        assertFalse(VoiceCommandParser.isWakeOnly("hey zora play"))
+     }
+ 
+     @Test
 diff --git a/cv/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt
 new file mode 100644
-index 0000000..8db8900
+index 0000000..e5e4b48
 --- /dev/null
 +++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt
 @@ -0,0 +1,26 @@
@@ -418,20 +561,20 @@ index 0000000..8db8900
 +import org.junit.Test
 +
 +class VoiceWakeGateTest {
-+    private val good = listOf(Word("hey", 1.0, 0.10, 0.35), Word("ben", 0.95, 0.35, 0.70))
++    private val good = listOf(Word("hey", 1.0, 0.10, 0.35), Word("zora", 0.95, 0.35, 0.70))
 +
 +    @Test
 +    fun acceptsExactPhraseWithGoodConfidenceAndSpan() {
-+        assertEquals(Verdict.Accept, VoiceWakeGate.judge("hey ben", "hey ben", good))
++        assertEquals(Verdict.Accept, VoiceWakeGate.judge("hey zora", "hey zora", good))
 +    }
 +
 +    @Test
 +    fun rejectsNoiseWordsLowConfidenceBadSpanAndMissingTimings() {
-+        assertTrue(VoiceWakeGate.judge("hey ben", "hey [unk]", good) is Verdict.Reject)
-+        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", null) is Verdict.Reject)
-+        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", listOf(Word("hey", 1.0, 0.1, 0.3), Word("ben", 0.5, 0.3, 0.7))) is Verdict.Reject)
-+        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", listOf(Word("hey", 1.0, 0.1, 0.15), Word("ben", 1.0, 0.15, 0.20))) is Verdict.Reject)
-+        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", listOf(Word("hey", 1.0, 0.0, 1.0), Word("ben", 1.0, 1.0, 2.5))) is Verdict.Reject)
-+        assertTrue(VoiceWakeGate.judge("hey ben", "so hey ben", good) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey zora", "hey [unk]", good) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey zora", "hey zora", null) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey zora", "hey zora", listOf(Word("hey", 1.0, 0.1, 0.3), Word("zora", 0.5, 0.3, 0.7))) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey zora", "hey zora", listOf(Word("hey", 1.0, 0.1, 0.15), Word("zora", 1.0, 0.15, 0.20))) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey zora", "hey zora", listOf(Word("hey", 1.0, 0.0, 1.0), Word("zora", 1.0, 1.0, 2.5))) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey zora", "so hey zora", good) is Verdict.Reject)
 +    }
 +}
