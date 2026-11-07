@@ -1,0 +1,125 @@
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -62,7 +62,7 @@
+         private const val COMMAND_START_DELAY_MS = 350L
+         private const val OUTCOME_TIMEOUT_MS = 20000L
+         private const val WAKE_COOLDOWN_MS = 1500L
+-        private const val HEALTH_TICK_MS = 3000L
++        private const val HEALTH_TICK_MS = 30000L
+         private const val END_SILENCE_S = 1.2f
+         private const val MAX_UTTERANCE_S = 15.0f
+         private const val COMMAND_LANG = "en-IN"
+@@ -427,8 +427,7 @@
+         // True only here: engine loaded and the wake listener thread is started.
+         running.value = true
+         Logger.w(TAG, "wake stage listening (sherpa keyword spotter)")
+-        handler.removeCallbacks(healthTick)
+-        handler.post(healthTick)
++        refreshHealthNow()
+     }
+ 
+     private fun onKeywordDetected(
+@@ -460,6 +459,7 @@
+         consecutiveErrors = 0
+         stage = Stage.COMMAND
+         lastCommandPartial = ""
++        refreshHealthNow()
+         releaseSpeech()
+         // Pause (instead of lowering the volume) so the mic does not hear the music while the
+         // command is captured. Only what we paused is restored, and only if no voice-chosen track starts.
+@@ -731,6 +731,12 @@
+             }
+         }
+ 
++    /** Refreshes the mic-health diagnostic notification now and restarts the slow cadence. */
++    private fun refreshHealthNow() {
++        handler.removeCallbacks(healthTick)
++        handler.post(healthTick)
++    }
++
+     private fun showLastCommand(text: String) {
+         Logger.w(TAG, "last command: $text")
+         handler.post {
+@@ -808,6 +814,7 @@
+      */
+     private fun handleRecognizerFault(kind: String) {
+         if (stopping || stage == Stage.LOADING) return
++        refreshHealthNow()
+         if (stage == Stage.COMMAND) showStatus("Listening problem. Nothing played. Music stays paused.")
+         consecutiveErrors += 1
+         if (consecutiveErrors >= VoiceStartGate.MAX_CONSECUTIVE_ERRORS) {
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+@@ -614,24 +614,10 @@
+                 top.map {
+                     VoiceTitleMatcher.Cand(title = it.title, artists = artistsOf(it), album = it.album?.name, videoId = it.videoId)
+                 }
+-            // Popularity signals for the tie-break: public views from a videos search (view counts
+-            // never make a non-matching song playable), then the user's own local history. A failed
+-            // videos search or missing counts degrade to the personal signal, then to refusal.
+-            val viewRows: List<VoiceTitleMatcher.ViewRow> =
+-                searchRepository.getSearchDataVideo(wanted).lastOrNull()?.let { resource ->
+-                    when (resource) {
+-                        is Resource.Success ->
+-                            resource.data?.map {
+-                                VoiceTitleMatcher.ViewRow(
+-                                    title = it.title,
+-                                    artists = it.artists?.mapNotNull { a -> a.name } ?: emptyList(),
+-                                    views = VoiceTitleMatcher.parseViews(it.views),
+-                                    videoId = it.videoId,
+-                                )
+-                            } ?: emptyList()
+-                        else -> emptyList()
+-                    }
+-                } ?: emptyList()
++            // Popularity signals for the tie-break: the user's own local history first. Public
++            // views are fetched lazily, only if the personal signals cannot resolve the pick
++            // (view counts never make a non-matching song playable). A failed videos search or
++            // missing counts degrade to the personal signal, then to refusal.
+             val candIds = onlineCands.map { it.videoId }
+             val localStats =
+                 runCatching { songRepository.getSongsByListVideoId(candIds).first() }
+@@ -645,18 +631,40 @@
+                         .flatMap { p -> runCatching { localPlaylistRepository.getListTrackVideoId(p.id) }.getOrDefault(emptyList()) }
+                         .toSet()
+                 }.getOrDefault(emptySet())
+-            val pop =
++            fun popWith(viewsOf: (VoiceTitleMatcher.Cand) -> Long?) =
+                 onlineCands.associate { cand ->
+                     val e = localStats[cand.videoId]
+                     cand.videoId to
+                         VoiceTitleMatcher.Pop(
+-                            views = VoiceTitleMatcher.viewsFor(wanted, cand, viewRows),
++                            views = viewsOf(cand),
+                             saved = e?.liked == true || playlistIds.contains(cand.videoId),
+                             plays = e?.totalPlayTime ?: 0,
+                         )
+                 }
++            // Pass 1: personal signals only (views unknown). Saved, then play count, decide first.
++            var decision = VoiceTitleMatcher.decideOnline(spoken, onlineCands, popWith { null })
++            if (decision is VoiceTitleMatcher.Online.Refuse && onlineCands.size > 1) {
++                // Personal signals could not resolve it: fetch public view counts and retry once.
++                // Identical outcome to an eager search, because views rank after saved and plays.
++                val viewRows: List<VoiceTitleMatcher.ViewRow> =
++                    searchRepository.getSearchDataVideo(wanted).lastOrNull()?.let { resource ->
++                        when (resource) {
++                            is Resource.Success ->
++                                resource.data?.map {
++                                    VoiceTitleMatcher.ViewRow(
++                                        title = it.title,
++                                        artists = it.artists?.mapNotNull { a -> a.name } ?: emptyList(),
++                                        views = VoiceTitleMatcher.parseViews(it.views),
++                                        videoId = it.videoId,
++                                    )
++                                } ?: emptyList()
++                            else -> emptyList()
++                        }
++                    } ?: emptyList()
++                decision = VoiceTitleMatcher.decideOnline(spoken, onlineCands, popWith { cand -> VoiceTitleMatcher.viewsFor(wanted, cand, viewRows) })
++            }
+             val pick =
+-                when (val d = VoiceTitleMatcher.decideOnline(spoken, onlineCands, pop)) {
++                when (val d = decision) {
+                     is VoiceTitleMatcher.Online.Play -> top.first { it.videoId == d.videoId }
+                     is VoiceTitleMatcher.Online.Refuse -> {
+                         val shown =
