@@ -1,0 +1,412 @@
+diff --git a/media/media3/consumer-rules.pro b/media/media3/consumer-rules.pro
+index 4b95fc2..19bdf1b 100644
+--- a/media/media3/consumer-rules.pro
++++ b/media/media3/consumer-rules.pro
+@@ -11,3 +11,6 @@
+ # on Android; R8 hard-errors on the missing types. Dead code on Android - Vosk never requests
+ # AWT component IDs. Verified the only non-Android reference surface in all of JNA 5.18.1.
+ -dontwarn java.awt.**
++# sherpa-onnx keyword spotter (Apache-2.0): its JNI layer binds the Kotlin classes, their native
++# methods and their data-class fields BY NAME (GetFieldID/GetMethodID), so R8 must not touch them.
++-keep class com.k2fsa.sherpa.onnx.** { *; }
+diff --git a/media/media3/src/main/assets/kws/keywords.txt b/media/media3/src/main/assets/kws/keywords.txt
+new file mode 100644
+index 0000000..5a7e4e8
+--- /dev/null
++++ b/media/media3/src/main/assets/kws/keywords.txt
+@@ -0,0 +1 @@
++▁HE Y ▁ Z OR A :1.5 #0.30
+diff --git a/media/media3/src/main/assets/voice-oss-notices.txt b/media/media3/src/main/assets/voice-oss-notices.txt
+index c8802b0..4d482bf 100644
+--- a/media/media3/src/main/assets/voice-oss-notices.txt
++++ b/media/media3/src/main/assets/voice-oss-notices.txt
+@@ -1,8 +1,8 @@
+ OPEN-SOURCE NOTICES - "Hey Zora" offline voice listener (SimpMusic fork addition)
+ 
+ This application includes the following third-party components for the offline
+-voice listener feature. Both are licensed under the Apache License, Version 2.0;
+-the full license text follows at the end of this file.
++voice listener feature. Items 1-4 are licensed under the Apache License, Version 2.0
++(see the note on item 4); item 5 is MIT. The Apache text follows at the end of this file.
+ 
+ 1) Vosk speech recognition library (com.alphacephei:vosk-android)
+    Copyright Alpha Cephei Inc. and contributors
+@@ -12,6 +12,22 @@ the full license text follows at the end of this file.
+    Copyright 2020 Alpha Cephei Inc
+    https://alphacephei.com/vosk/models
+ 
++3) sherpa-onnx (keyword spotting engine and Kotlin/JNI API, release v2.0.1)
++   Copyright (c) Xiaomi Corporation and k2-fsa contributors. Apache License, Version 2.0.
++   https://github.com/k2-fsa/sherpa-onnx
++
++4) Keyword spotting model sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01
++   The model publisher's README (shipped inside the official release archive) states
++   "license: Apache License 2.0". The archive carries no separate LICENSE file. The model was
++   trained on GigaSpeech XL; GigaSpeech's dataset terms limit dataset access to non-commercial
++   research and say the user of a model trained on it must verify fair-use terms for their use.
++   That question has not been answered upstream. Treat this model as for private use only.
++   https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models
++
++5) ONNX Runtime (libonnxruntime.so shipped in the sherpa-onnx Android release)
++   Copyright (c) Microsoft Corporation. MIT License.
++   https://github.com/microsoft/onnxruntime
++
+ ========================================================================
+ Apache License, Version 2.0 (full text)
+ ========================================================================
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceKeywordWake.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceKeywordWake.kt
+new file mode 100644
+index 0000000..6025a5c
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceKeywordWake.kt
+@@ -0,0 +1,167 @@
++package com.maxrave.media3.voice
++
++import android.annotation.SuppressLint
++import android.content.res.AssetManager
++import android.media.AudioFormat
++import android.media.AudioRecord
++import android.media.MediaRecorder
++import com.k2fsa.sherpa.onnx.FeatureConfig
++import com.k2fsa.sherpa.onnx.KeywordSpotter
++import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
++import com.k2fsa.sherpa.onnx.OnlineModelConfig
++import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
++import com.maxrave.logger.Logger
++
++/**
++ * Wake-word detection with the sherpa-onnx streaming keyword spotter (offline, on-device). It
++ * replaces the Vosk phrase grammar for the wake stage only: the grammar always force-fitted
++ * background sound to the phrase. The spotter only reports a keyword from the line(s) in
++ * assets/kws/keywords.txt. Audio stays in memory; nothing is recorded to disk or sent anywhere.
++ *
++ * The trigger threshold and boost in keywords.txt are starting values, NOT measured on the user's
++ * voice or room. Detections are shown in the "Last wake check" notification.
++ */
++internal class VoiceKeywordWake(
++    private val spotter: KeywordSpotter,
++) {
++    @Volatile private var running = false
++    private var thread: Thread? = null
++
++    /** Called on the audio thread for each detection; the caller must hop to its own thread. */
++    fun start(
++        onDetect: (keyword: String, tokens: String, timestamps: String) -> Unit,
++        onFault: (String) -> Unit,
++    ) {
++        if (running) return
++        running = true
++        val t =
++            Thread({ loop(onDetect, onFault) }, "voice-kws").also {
++                it.isDaemon = true
++                thread = it
++            }
++        t.start()
++    }
++
++    /** Stops the audio thread and waits briefly so the microphone is free for the next stage. */
++    fun stop() {
++        running = false
++        val t = thread ?: return
++        thread = null
++        try {
++            t.join(1500)
++        } catch (_: InterruptedException) {
++            Thread.currentThread().interrupt()
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun loop(
++        onDetect: (String, String, String) -> Unit,
++        onFault: (String) -> Unit,
++    ) {
++        var record: AudioRecord? = null
++        var stream: com.k2fsa.sherpa.onnx.OnlineStream? = null
++        try {
++            val min = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
++            if (min <= 0) {
++                onFault("audio buffer size $min")
++                return
++            }
++            record =
++                AudioRecord(
++                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
++                    SAMPLE_RATE,
++                    AudioFormat.CHANNEL_IN_MONO,
++                    AudioFormat.ENCODING_PCM_16BIT,
++                    maxOf(min, SAMPLE_RATE),
++                )
++            if (record.state != AudioRecord.STATE_INITIALIZED) {
++                onFault("microphone not available")
++                return
++            }
++            stream = spotter.createStream()
++            record.startRecording()
++            val shorts = ShortArray(CHUNK)
++            val floats = FloatArray(CHUNK)
++            while (running) {
++                val n = record.read(shorts, 0, CHUNK)
++                if (n < 0) {
++                    onFault("audio read error $n")
++                    return
++                }
++                if (n == 0) {
++                    Thread.sleep(10)
++                    continue
++                }
++                toFloats(shorts, n, floats)
++                stream.acceptWaveform(if (n == CHUNK) floats else floats.copyOf(n), SAMPLE_RATE)
++                while (running && spotter.isReady(stream)) {
++                    spotter.decode(stream)
++                    val r = spotter.getResult(stream)
++                    if (r.keyword.isNotEmpty()) {
++                        spotter.reset(stream)
++                        onDetect(
++                            r.keyword,
++                            r.tokens.joinToString(" "),
++                            r.timestamps.joinToString(", ") { "%.2f".format(it) },
++                        )
++                    }
++                }
++            }
++        } catch (e: Throwable) {
++            Logger.e(TAG, "keyword listener failed: ${e.message}")
++            onFault("keyword listener failed: ${e.message}")
++        } finally {
++            try {
++                record?.stop()
++            } catch (_: Exception) {
++            }
++            try {
++                record?.release()
++            } catch (_: Exception) {
++            }
++            try {
++                stream?.release()
++            } catch (_: Exception) {
++            }
++        }
++    }
++
++    companion object {
++        private const val TAG = "VoiceKeywordWake"
++        const val SAMPLE_RATE = 16000
++        private const val CHUNK = 1600 // 100 ms
++
++        /** PCM16 to the -1..1 floats the spotter expects. */
++        internal fun toFloats(
++            shorts: ShortArray,
++            n: Int,
++            out: FloatArray,
++        ) {
++            for (i in 0 until n) out[i] = shorts[i] / 32768f
++        }
++
++        /** Builds the spotter from assets/kws (model files are fetched and hash-checked in CI). */
++        fun createSpotter(assets: AssetManager): KeywordSpotter {
++            val model =
++                OnlineModelConfig(
++                    transducer =
++                        OnlineTransducerModelConfig(
++                            encoder = "kws/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
++                            decoder = "kws/decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
++                            joiner = "kws/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
++                        ),
++                    tokens = "kws/tokens.txt",
++                    numThreads = 1,
++                    modelType = "zipformer2",
++                )
++            val config =
++                KeywordSpotterConfig(
++                    featConfig = FeatureConfig(sampleRate = SAMPLE_RATE, featureDim = 80),
++                    modelConfig = model,
++                    keywordsFile = "kws/keywords.txt",
++                )
++            return KeywordSpotter(assets, config)
++        }
++    }
++}
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index f5f147d..c51d4ff 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -81,6 +81,8 @@ class VoiceListenService : Service() {
+     private var consecutiveErrors = 0
+     private var model: Model? = null
+     private var speechService: SpeechService? = null
++    private var spotter: com.k2fsa.sherpa.onnx.KeywordSpotter? = null
++    private var kwsWake: VoiceKeywordWake? = null
+     private var wakeLock: PowerManager.WakeLock? = null
+     private var controller: MediaController? = null
+     private var pausedByUs = false
+@@ -362,9 +364,32 @@ class VoiceListenService : Service() {
+             "model-en-us",
+             "voice-model",
+             { unpacked ->
+-                loading = false
+                 model = unpacked
+-                enterWakeStage()
++                // The wake engine (sherpa-onnx keyword spotter) loads off the main thread.
++                Thread({
++                    try {
++                        val s = VoiceKeywordWake.createSpotter(assets)
++                        handler.post {
++                            loading = false
++                            if (stopping) {
++                                s.release()
++                            } else {
++                                spotter = s
++                                enterWakeStage()
++                            }
++                        }
++                    } catch (e: Throwable) {
++                        Logger.e(TAG, "wake engine load failed: ${e.message}")
++                        handler.post {
++                            loading = false
++                            try {
++                                Toast.makeText(applicationContext, "Wake engine failed to load: ${e.message}", Toast.LENGTH_LONG).show()
++                            } catch (_: Exception) {
++                            }
++                            shutdown()
++                        }
++                    }
++                }, "voice-kws-load").start()
+             },
+             { error ->
+                 loading = false
+@@ -377,21 +402,41 @@ class VoiceListenService : Service() {
+     private fun enterWakeStage() {
+         if (stopping) return
+         releaseSpeech()
+-        val m = model ?: return
++        val sp = spotter ?: return
+         stage = Stage.WAKE
+         lastCommandPartial = ""
+-        val grammar = "[\"${VoiceCommandParser.WAKE_PHRASE}\", \"[unk]\"]"
+-        val rec = Recognizer(m, 16000.0f, grammar)
+-        // Word timings + confidences are what VoiceWakeGate checks on the FINAL wake result.
+-        rec.setWords(true)
+-        recognizer = rec
+-        speechService =
+-            SpeechService(rec, 16000.0f).also {
+-                it.startListening(SessionListener(gen))
+-            }
+-        // True only here: model unpacked and the wake recognizer is actually listening.
++        val myGen = gen
++        val wake = VoiceKeywordWake(sp)
++        kwsWake = wake
++        wake.start(
++            onDetect = { keyword, tokens, times -> handler.post { onKeywordDetected(myGen, keyword, tokens, times) } },
++            onFault = { reason -> handler.post { onWakeFault(myGen, reason) } },
++        )
++        // True only here: engine loaded and the wake listener thread is started.
+         running.value = true
+-        Logger.w(TAG, "wake stage listening")
++        Logger.w(TAG, "wake stage listening (sherpa keyword spotter)")
++    }
++
++    private fun onKeywordDetected(
++        myGen: Int,
++        keyword: String,
++        tokens: String,
++        times: String,
++    ) {
++        if (stopping || myGen != gen || stage != Stage.WAKE) return
++        if (SystemClock.elapsedRealtime() < ignoreWakeUntil) return
++        val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
++        showLastWakeCheck("Wake accepted at $stamp\nkeyword \"$keyword\", tokens [$tokens], timestamps [$times]")
++        enterCommandStage()
++    }
++
++    private fun onWakeFault(
++        myGen: Int,
++        reason: String,
++    ) {
++        if (stopping || myGen != gen || stage != Stage.WAKE) return
++        Logger.e(TAG, "wake listener fault: $reason")
++        handleRecognizerFault("wake listener ($reason)")
+     }
+ 
+     private fun enterCommandStage() {
+@@ -702,6 +747,12 @@ class VoiceListenService : Service() {
+             Logger.w(TAG, "speech release: ${e.message}")
+         }
+         speechService = null
++        try {
++            kwsWake?.stop()
++        } catch (e: Exception) {
++            Logger.w(TAG, "keyword wake stop: ${e.message}")
++        }
++        kwsWake = null
+         try {
+             recognizer?.close()
+         } catch (e: Exception) {
+@@ -723,6 +774,12 @@ class VoiceListenService : Service() {
+         VoiceDiagnostics.sink = null
+         handler.removeCallbacks(outcomeTimeout)
+         releaseSpeech()
++        try {
++            spotter?.release()
++        } catch (e: Exception) {
++            Logger.w(TAG, "spotter release: ${e.message}")
++        }
++        spotter = null
+         try {
+             model?.close()
+         } catch (e: Exception) {
+@@ -752,6 +809,12 @@ class VoiceListenService : Service() {
+             VoiceDiagnostics.sink = null
+             handler.removeCallbacks(outcomeTimeout)
+             releaseSpeech()
++            try {
++                spotter?.release()
++            } catch (e: Exception) {
++                Logger.w(TAG, "spotter release: ${e.message}")
++            }
++            spotter = null
+             try {
+                 model?.close()
+             } catch (e: Exception) {
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceKeywordWakeTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceKeywordWakeTest.kt
+new file mode 100644
+index 0000000..c7f4528
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceKeywordWakeTest.kt
+@@ -0,0 +1,36 @@
++package com.maxrave.media3.voice
++
++import java.io.File
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class VoiceKeywordWakeTest {
++    private val assets = File("src/main/assets/kws")
++
++    @Test
++    fun convertsPcm16ToUnitFloats() {
++        val out = FloatArray(4)
++        VoiceKeywordWake.toFloats(shortArrayOf(0, 16384, -32768, 32767), 4, out)
++        assertEquals(0f, out[0], 0f)
++        assertEquals(0.5f, out[1], 0f)
++        assertEquals(-1f, out[2], 0f)
++        assertTrue(out[3] < 1f && out[3] > 0.999f)
++    }
++
++    @Test
++    fun keywordLineIsOneKeywordWithKnownTokensAndSaneThresholds() {
++        val lines = File(assets, "keywords.txt").readLines().filter { it.isNotBlank() }
++        assertEquals("exactly one wake keyword", 1, lines.size)
++        val parts = lines[0].trim().split(' ')
++        val tokens = parts.filter { !it.startsWith(":") && !it.startsWith("#") }
++        val known = File(assets, "tokens.txt").readLines().map { it.substringBefore(' ') }.toSet()
++        assertTrue("tokens missing from tokens.txt: ${tokens.filter { it !in known }}", tokens.all { it in known })
++        // The tokens must spell HEY ZORA, nothing else.
++        assertEquals("HEY ZORA", tokens.joinToString("").replace("\u2581", " ").trim())
++        val score = parts.first { it.startsWith(":") }.drop(1).toFloat()
++        val threshold = parts.first { it.startsWith("#") }.drop(1).toFloat()
++        assertTrue(score in 0.5f..4f)
++        assertTrue(threshold in 0.1f..0.9f)
++    }
++}

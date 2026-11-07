@@ -37,6 +37,54 @@ jobs:
       - name: Apply wake diagnostics patch (last wake check notification, conf-missing report) to core submodule
         run: git -C core apply ../patches/voice-wake-diagnostics.patch
 
+      - name: Apply sherpa-onnx keyword-spotter wake patch to core submodule
+        run: git -C core apply ../patches/voice-sherpa-wake.patch
+
+      - name: Fetch sherpa-onnx v2.0.1 Kotlin API, arm64 libs and KWS model (every file sha256-verified)
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/sherpa"; mkdir -p "$T"
+          R=https://github.com/k2-fsa/sherpa-onnx/releases/download
+          RAW=https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v2.0.1/sherpa-onnx/kotlin-api
+          M=core/media/media3/src/main
+          # Kotlin/JNI API sources (unmodified, Apache-2.0)
+          mkdir -p "$M/java/com/k2fsa/sherpa/onnx"
+          while read -r sum name; do
+            curl -fsSL "$RAW/$name" -o "$M/java/com/k2fsa/sherpa/onnx/$name"
+            echo "$sum  $M/java/com/k2fsa/sherpa/onnx/$name" | sha256sum -c -
+          done <<'LIST'
+          6d8387534b942a979424a1d6721fd285f85df8bfca0ea392860f11fe06f31d06 KeywordSpotter.kt
+          3204ff816361d99d94dda1e8c26681f6d4a5ad749a68d8fee93b4e8bb2b21d17 OnlineRecognizer.kt
+          6b9f8de317e6a0bb51f0f29d940617b781cb31b190e1c725dd438231836c06ab OnlineStream.kt
+          829c7adc4db1324f21b9a9cbf5bf10eacf759714fe50956f48317c1ffef044f6 FeatureConfig.kt
+          fe926b6413f4d87e67c41feb21b8363923a67cbd3a5eb687b76390a5f1f7db60 HomophoneReplacerConfig.kt
+          86c963f27677f690eb0d6639735052eba5e60d9f81ccd4c1df0aa831fd680d6f QnnConfig.kt
+          LIST
+          # arm64 native libs from the official Android release (asset digest checked)
+          curl -fsSL "$R/v2.0.1/sherpa-onnx-v2.0.1-android.tar.bz2" -o "$T/android.tar.bz2"
+          echo "39003753ec293425ed56723ea9b972b98841a490af3311670c3060548d654330  $T/android.tar.bz2" | sha256sum -c -
+          tar -xjf "$T/android.tar.bz2" -C "$T" ./jniLibs/arm64-v8a/libsherpa-onnx-jni.so ./jniLibs/arm64-v8a/libonnxruntime.so
+          echo "5db8f89f12b2c900a98c9e01e00c475c59db35e9437a62e36e27839ec48b5575  $T/jniLibs/arm64-v8a/libsherpa-onnx-jni.so" | sha256sum -c -
+          echo "33847ad43bffe204699fd4a27f7f3603452a8cdaf2f9a44983a0bc31ffcf2da1  $T/jniLibs/arm64-v8a/libonnxruntime.so" | sha256sum -c -
+          mkdir -p "$M/jniLibs/arm64-v8a"
+          cp "$T"/jniLibs/arm64-v8a/libsherpa-onnx-jni.so "$T"/jniLibs/arm64-v8a/libonnxruntime.so "$M/jniLibs/arm64-v8a/"
+          # KWS model (int8 encoder/joiner, fp32 decoder) + its README for the notices
+          curl -fsSL "$R/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2" -o "$T/kws.tar.bz2"
+          echo "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a  $T/kws.tar.bz2" | sha256sum -c -
+          tar -xjf "$T/kws.tar.bz2" -C "$T"
+          D="$T/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+          mkdir -p "$M/assets/kws"
+          for f in tokens.txt encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx decoder-epoch-12-avg-2-chunk-16-left-64.onnx joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx; do cp "$D/$f" "$M/assets/kws/$f"; done
+          cp "$D/README.md" "$M/assets/kws/MODEL-README.md"
+          ( cd "$M/assets/kws" && cat <<'SUMS' | sha256sum -c -
+          fd2ded4050a55d2b1578870ba8697d02371980217806b7558bd0a5cc60f3ba53  tokens.txt
+          1e721676515bcd42a186979733981213c66c80db680e1cc582dfedf3be76e678  encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx
+          f61ebd3eed3773a44d088d53dfae92dbb6aec4839f4dcaee2d402414741663a3  decoder-epoch-12-avg-2-chunk-16-left-64.onnx
+          eae9da0c7e1e6c6a3f4cc42d167899c388f6c6701b94cb96320e4f55df79624c  joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx
+          74e42d37d63acd2366b042151d576fcc0c4917a41de339414a37f1e79f4e80e2  MODEL-README.md
+          SUMS
+          )
+
       - name: Fetch offline speech model (sha256-verified)
         run: |
           curl -fsSL "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" -o "$RUNNER_TEMP/vosk-model.zip"
