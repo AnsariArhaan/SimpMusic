@@ -12,7 +12,7 @@ index 0a8206e..9b9b0ce 100644
              ),
          )
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
-index 3677d05..60d471d 100644
+index 3677d05..f6ddba6 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
 @@ -614,8 +614,48 @@ internal class SimpleMediaSessionCallback(
@@ -54,7 +54,7 @@ index 3677d05..60d471d 100644
 +                    val e = localStats[cand.videoId]
 +                    cand.videoId to
 +                        VoiceTitleMatcher.Pop(
-+                            views = VoiceTitleMatcher.viewsFor(cand, viewRows),
++                            views = VoiceTitleMatcher.viewsFor(wanted, cand, viewRows),
 +                            saved = e?.liked == true || playlistIds.contains(cand.videoId),
 +                            plays = e?.totalPlayTime ?: 0,
 +                        )
@@ -66,7 +66,7 @@ index 3677d05..60d471d 100644
                      is VoiceTitleMatcher.Online.Refuse -> {
                          val shown =
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
-index 8ee769a..d7c1d7c 100644
+index 8ee769a..a60b8c8 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 @@ -51,6 +51,7 @@ internal object VoiceTitleMatcher {
@@ -113,7 +113,7 @@ index 8ee769a..d7c1d7c 100644
              val seen = hits.take(3).joinToString(", ") { "${it.artists.firstOrNull() ?: "?"}${it.album?.let { a -> " ($a)" } ?: ""}" }
              return Online.Refuse("several versions of \"${spoken.title}\": $seen. Say the movie or artist too")
          }
-@@ -213,6 +216,142 @@ internal object VoiceTitleMatcher {
+@@ -213,6 +216,162 @@ internal object VoiceTitleMatcher {
          return Online.Refuse("no confident match for \"${spoken.full}\"")
      }
  
@@ -207,11 +207,30 @@ index 8ee769a..d7c1d7c 100644
 +        return (num * mult).toLong()
 +    }
 +
++    /** Extra video-row tags that disqualify a view-count source even when the artist agrees. */
++    private val viewRowBlocked = setOf("lyric", "lyrics", "reupload", "reuploaded", "short", "shorts", "amv", "fmv", "edit", "sped")
++
 +    /**
-+     * Public views for a song candidate: the videos-shelf row must carry the same normalised title
-+     * and share at least one artist word, so a same-title video by someone else never donates views.
++     * Whether a videos-shelf row may donate its view count: same variant guards as playback
++     * (an unasked live/remix/cover version never donates) plus video-only tags like lyrics/AMV.
++     */
++    private fun viewRowEligible(
++        wanted: String,
++        title: String,
++    ): Boolean {
++        if (isUnaskedVariant(wanted, title)) return false
++        val asked = wanted.split(' ').toSet()
++        val tokens = title.lowercase().split(nonWord).filter { it.isNotEmpty() }
++        return tokens.none { it in viewRowBlocked && it !in asked }
++    }
++
++    /**
++     * Public views for a song candidate: the videos-shelf row must carry the same normalised title,
++     * share at least one artist word, and pass the version guards, so a same-title cover, lyric
++     * video or another artist's upload never donates views. No eligible row -> unknown, not zero.
 +     */
 +    fun viewsFor(
++        wanted: String,
 +        c: Cand,
 +        rows: List<ViewRow>,
 +    ): Long? {
@@ -219,7 +238,8 @@ index 8ee769a..d7c1d7c 100644
 +        val myArtists = c.artists.flatMap { words(it) }.toSet()
 +        return rows
 +            .filter { r ->
-+                normalize(r.title) == myTitle &&
++                viewRowEligible(wanted, r.title) &&
++                    normalize(r.title) == myTitle &&
 +                    r.artists.flatMap { words(it) }.any { it in myArtists }
 +            }.mapNotNull { it.views }
 +            .maxOrNull()
@@ -257,10 +277,10 @@ index 8ee769a..d7c1d7c 100644
      fun matchLikedQualified(
          spoken: Spoken,
 diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
-index 8020c83..5efeb60 100644
+index 8020c83..60b7361 100644
 --- a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
 +++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
-@@ -73,4 +73,109 @@ class VoiceOnlineDecisionTest {
+@@ -73,4 +73,136 @@ class VoiceOnlineDecisionTest {
              VoiceTitleMatcher.matchLikedQualified(VoiceTitleMatcher.parse("chammak challo"), liked) is VoiceTitleMatcher.Liked.Ambiguous,
          )
      }
@@ -366,8 +386,35 @@ index 8020c83..5efeb60 100644
 +                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Some DJ"), 999_000_000L),
 +                VoiceTitleMatcher.ViewRow("Chammak Chhallo", listOf("Keshaw Sahu"), 12_000L),
 +            )
-+        assertEquals(760_000_000L, VoiceTitleMatcher.viewsFor(vishal, rows))
-+        assertEquals(12_000L, VoiceTitleMatcher.viewsFor(keshaw, rows))
++        assertEquals(760_000_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
++        assertEquals(12_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", keshaw, rows))
++    }
++
++    @Test
++    fun viewsForRefusesVariantAndLyricVideos() {
++        val rows =
++            listOf(
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Live)", listOf("Vishal-Shekhar"), 900_000_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Cover)", listOf("Akon"), 5_000_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo Lyrics Video", listOf("Akon"), 300_000_000L),
++                VoiceTitleMatcher.ViewRow("CHAMMAK CHALLO | Anime Dance [AMV/Edit]", listOf("OximeFx"), 189_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar", "Hamsika Iyer"), 760_000_000L),
++            )
++        // Only the plain official video donates; live/cover/lyric/AMV versions never do.
++        assertEquals(760_000_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
++    }
++
++    @Test
++    fun onlyVariantVideosMeansViewsUnknown() {
++        val rows =
++            listOf(
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Slowed)", listOf("Vishal-Shekhar"), 900_000_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Lyrics)", listOf("Akon"), 300_000_000L),
++            )
++        assertEquals(null, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
++        // Unknown views -> the personal signal decides instead of an invented popularity.
++        val pop = mapOf("VS" to popOf(null, false, 4), "KS" to popOf(null, false, 1))
++        assertEquals(Online.Play("VS"), decidePop("chhammak chhallo", pop, keshaw, vishal))
 +    }
  }
 diff --git a/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt b/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt
