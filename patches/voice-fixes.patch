@@ -1,5 +1,5 @@
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
-index bac97c6..62570ad 100644
+index bac97c6..db9929f 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
 @@ -45,6 +45,8 @@ import com.maxrave.domain.utils.connectArtists
@@ -11,7 +11,7 @@ index bac97c6..62570ad 100644
  import com.maxrave.domain.utils.toPlaylistEntity
  import com.maxrave.domain.utils.toSongEntity
  import com.maxrave.domain.utils.toTrack
-@@ -543,6 +545,89 @@ internal class SimpleMediaSessionCallback(
+@@ -543,6 +545,101 @@ internal class SimpleMediaSessionCallback(
              } ?: LibraryResult.ofError(SessionError.ERROR_UNKNOWN)
          }
  
@@ -27,7 +27,6 @@ index bac97c6..62570ad 100644
 +            when (val liked = VoiceTitleMatcher.matchLiked(wanted, titles)) {
 +                is VoiceTitleMatcher.Liked.Play -> {
 +                    val matched = likedSongs[liked.index].toTrack()
-+                    VoiceDiagnostics.report("Playing \"${titles[liked.index]}\" from liked songs.", VoiceOutcome.PLAYED)
 +                    mediaPlayerHandler.setQueueData(
 +                        QueueData.Data(
 +                            listTracks = likedSongs.toArrayListTrack(),
@@ -39,6 +38,7 @@ index bac97c6..62570ad 100644
 +                        ),
 +                    )
 +                    mediaPlayerHandler.loadMediaItem(matched, Config.PLAYLIST_CLICK, liked.index)
++                    VoiceDiagnostics.report("Handed \"${titles[liked.index]}\" (liked songs) to the player.", VoiceOutcome.PLAYED)
 +                    return
 +                }
 +
@@ -69,18 +69,29 @@ index bac97c6..62570ad 100644
 +                    return
 +                }
 +            val top = results.filter { it.isAvailable }.take(5)
-+            val pick =
-+                top.firstOrNull { VoiceTitleMatcher.isExact(wanted, it.title) }
-+                    ?: top.firstOrNull { VoiceTitleMatcher.acceptOnline(wanted, it.title, it.artists?.mapNotNull { a -> a.name } ?: emptyList()) }
++            fun artistsOf(t: Track): List<String> = t.artists?.mapNotNull { a -> a.name } ?: emptyList()
++            val exact = top.filter { VoiceTitleMatcher.isExact(wanted, it.title) }
++            val candidates = exact.ifEmpty { top.filter { VoiceTitleMatcher.acceptOnline(wanted, it.title, artistsOf(it)) } }
++            // No artist spoken (every heard word is in the title) and several different primary artists
++            // qualify: do not guess which one is meant.
++            val artistSpoken = candidates.any { c -> VoiceTitleMatcher.heardArtist(wanted, c.title) }
++            val distinctArtists = candidates.map { c -> artistsOf(c).firstOrNull()?.let { VoiceTitleMatcher.normalize(it) } ?: "" }.distinct()
++            val pick = if (candidates.isNotEmpty() && (artistSpoken || distinctArtists.size == 1)) candidates.first() else null
 +            if (pick == null) {
-+                val seen = top.take(2).joinToString(", ") { "\"${it.title}\"" }
++                val shown =
++                    (if (candidates.isNotEmpty()) candidates else top).take(3)
++                        .joinToString(", ") { "\"${it.title}\" - ${artistsOf(it).firstOrNull() ?: "?"}" }
 +                VoiceDiagnostics.report(
-+                    "Not played: no confident match online for \"$wanted\"." + if (seen.isNotEmpty()) " Top results: $seen." else "",
++                    if (candidates.isNotEmpty()) {
++                        "Not played: several artists have \"$wanted\". Say the artist too: $shown."
++                    } else {
++                        "Not played: no confident match online for \"$wanted\"." +
++                            if (shown.isNotEmpty()) " Top results: $shown." else ""
++                    },
 +                    VoiceOutcome.NOT_PLAYED,
 +                )
 +                return
 +            }
-+            VoiceDiagnostics.report("Playing \"${pick.title}\" (online search).", VoiceOutcome.PLAYED)
 +            mediaPlayerHandler.setQueueData(
 +                QueueData.Data(
 +                    listTracks = arrayListOf(pick),
@@ -92,6 +103,7 @@ index bac97c6..62570ad 100644
 +                ),
 +            )
 +            mediaPlayerHandler.loadMediaItem(pick, Config.SONG_CLICK, 0)
++            VoiceDiagnostics.report("Handed \"${pick.title}\" (online search) to the player.", VoiceOutcome.PLAYED)
 +        } catch (e: Exception) {
 +            if (e is kotlinx.coroutines.CancellationException) throw e
 +            VoiceDiagnostics.report("Not played: voice request failed (${e.message}).", VoiceOutcome.NOT_PLAYED)
@@ -101,7 +113,7 @@ index bac97c6..62570ad 100644
      @UnstableApi
      override fun onSetMediaItems(
          mediaSession: MediaSession,
-@@ -566,39 +651,7 @@ internal class SimpleMediaSessionCallback(
+@@ -566,39 +663,7 @@ internal class SimpleMediaSessionCallback(
                      ?.trim()
                      ?.takeIf { it.isNotEmpty() }
              if (voiceQuery != null) {
@@ -144,10 +156,10 @@ index bac97c6..62570ad 100644
              val path =
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 new file mode 100644
-index 0000000..582c5de
+index 0000000..0414afd
 --- /dev/null
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,111 @@
 +package com.maxrave.media3.service.callback
 +
 +/**
@@ -248,6 +260,15 @@ index 0000000..582c5de
 +        val inTitle = heard.count { it in titleSet }
 +        if (inTitle == 0) return false
 +        return inTitle.toDouble() / titleWords.size >= 0.5
++    }
++
++    /** True when at least one heard word is not part of the title, i.e. the user also said an artist. */
++    fun heardArtist(
++        wanted: String,
++        title: String,
++    ): Boolean {
++        val titleSet = normalize(title).split(' ').toSet()
++        return wanted.split(' ').filter { it.isNotEmpty() && it !in allowedExtra }.any { it !in titleSet }
 +    }
 +}
 diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
@@ -844,10 +865,10 @@ index 0000000..9e5d1b7
 +}
 diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
 new file mode 100644
-index 0000000..a2bd98f
+index 0000000..d088f15
 --- /dev/null
 +++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,75 @@
 +package com.maxrave.media3.service.callback
 +
 +import org.junit.Assert.assertEquals
@@ -915,6 +936,12 @@ index 0000000..a2bd98f
 +    @Test
 +    fun wrongArtistIsRejected() {
 +        assertFalse(VoiceTitleMatcher.acceptOnline("royalty by egzod", "Royalty", listOf("Other Artist")))
++    }
++
++    @Test
++    fun heardArtistDetection() {
++        assertFalse(VoiceTitleMatcher.heardArtist("royalty", "Royalty (feat. X)"))
++        assertTrue(VoiceTitleMatcher.heardArtist("royalty by egzod", "Royalty"))
 +    }
 +}
 diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
