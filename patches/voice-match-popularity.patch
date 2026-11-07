@@ -12,10 +12,10 @@ index 0a8206e..9b9b0ce 100644
              ),
          )
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
-index 3677d05..f6ddba6 100644
+index 3677d05..1683b8b 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
-@@ -614,8 +614,48 @@ internal class SimpleMediaSessionCallback(
+@@ -614,8 +614,49 @@ internal class SimpleMediaSessionCallback(
                  top.map {
                      VoiceTitleMatcher.Cand(title = it.title, artists = artistsOf(it), album = it.album?.name, videoId = it.videoId)
                  }
@@ -31,6 +31,7 @@ index 3677d05..f6ddba6 100644
 +                                    title = it.title,
 +                                    artists = it.artists?.mapNotNull { a -> a.name } ?: emptyList(),
 +                                    views = VoiceTitleMatcher.parseViews(it.views),
++                                    videoId = it.videoId,
 +                                )
 +                            } ?: emptyList()
 +                        else -> emptyList()
@@ -66,7 +67,7 @@ index 3677d05..f6ddba6 100644
                      is VoiceTitleMatcher.Online.Refuse -> {
                          val shown =
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
-index 8ee769a..a60b8c8 100644
+index 8ee769a..59baf71 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 @@ -51,6 +51,7 @@ internal object VoiceTitleMatcher {
@@ -113,7 +114,7 @@ index 8ee769a..a60b8c8 100644
              val seen = hits.take(3).joinToString(", ") { "${it.artists.firstOrNull() ?: "?"}${it.album?.let { a -> " ($a)" } ?: ""}" }
              return Online.Refuse("several versions of \"${spoken.title}\": $seen. Say the movie or artist too")
          }
-@@ -213,6 +216,162 @@ internal object VoiceTitleMatcher {
+@@ -213,6 +216,170 @@ internal object VoiceTitleMatcher {
          return Online.Refuse("no confident match for \"${spoken.full}\"")
      }
  
@@ -188,6 +189,7 @@ index 8ee769a..a60b8c8 100644
 +        val title: String,
 +        val artists: List<String>,
 +        val views: Long?,
++        val videoId: String,
 +    )
 +
 +    private val viewsText = Regex("(?i)^\s*([\d.,]+)\s*([KMB]?)\s+views?\s*$")
@@ -236,31 +238,32 @@ index 8ee769a..a60b8c8 100644
 +    ): Long? {
 +        val myTitle = normalize(c.title)
 +        val myArtists = c.artists.flatMap { words(it) }.toSet()
-+        return rows
-+            .filter { r ->
++        val donors =
++            rows.filter { r ->
 +                viewRowEligible(wanted, r.title) &&
 +                    normalize(r.title) == myTitle &&
 +                    r.artists.flatMap { words(it) }.any { it in myArtists }
-+            }.mapNotNull { it.views }
-+            .maxOrNull()
++            }
++        // A donor carrying the candidate's own videoId is the same upload: proven binding.
++        donors.firstOrNull { it.videoId == c.videoId }?.let { return it.views }
++        // Title+artist is only a heuristic binding. Several eligible donors with different counts
++        // (e.g. an official video and an official audio upload) cannot be told apart, so the count
++        // is unknown - never silently the max - and the personal signal decides instead.
++        val distinct = donors.mapNotNull { it.views }.distinct()
++        return if (distinct.size == 1) distinct[0] else null
 +    }
 +
 +    /**
 +     * Tie-break between several matching versions of the requested title; popularity never makes a
-+     * non-matching song playable. Public views first: a unique highest known count wins. Equal or
-+     * unknown views fall back to the user's own data: a unique saved (liked/playlisted) track wins,
-+     * otherwise a unique highest local play count wins. Still tied -> null and the caller refuses.
++     * non-matching song playable. User-confirmed order: personal signals first - a unique saved
++     * (liked/playlisted) track wins, else a unique highest local play count - and public views are
++     * the last resort: a unique highest known count wins only when personal data cannot decide.
++     * Still tied -> null and the caller refuses.
 +     */
 +    private fun popularityPick(
 +        hits: List<Cand>,
 +        pop: Map<String, Pop>,
 +    ): Cand? {
-+        val withViews = hits.mapNotNull { h -> pop[h.videoId]?.views?.let { h to it } }
-+        if (withViews.isNotEmpty()) {
-+            val maxViews = withViews.maxOf { it.second }
-+            val winners = withViews.filter { it.second == maxViews }
-+            if (winners.size == 1) return winners[0].first
-+        }
 +        val saved = hits.filter { pop[it.videoId]?.saved == true }
 +        if (saved.size == 1) return saved[0]
 +        val pool = if (saved.size > 1) saved else hits
@@ -270,6 +273,12 @@ index 8ee769a..a60b8c8 100644
 +            val winners = withPlays.filter { it.second == maxPlays }
 +            if (winners.size == 1) return winners[0].first
 +        }
++        val withViews = hits.mapNotNull { h -> pop[h.videoId]?.views?.let { h to it } }
++        if (withViews.isNotEmpty()) {
++            val maxViews = withViews.maxOf { it.second }
++            val winners = withViews.filter { it.second == maxViews }
++            if (winners.size == 1) return winners[0].first
++        }
 +        return null
 +    }
 +
@@ -277,10 +286,10 @@ index 8ee769a..a60b8c8 100644
      fun matchLikedQualified(
          spoken: Spoken,
 diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
-index 8020c83..60b7361 100644
+index 8020c83..a7beb12 100644
 --- a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
 +++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
-@@ -73,4 +73,136 @@ class VoiceOnlineDecisionTest {
+@@ -73,4 +73,176 @@ class VoiceOnlineDecisionTest {
              VoiceTitleMatcher.matchLikedQualified(VoiceTitleMatcher.parse("chammak challo"), liked) is VoiceTitleMatcher.Liked.Ambiguous,
          )
      }
@@ -312,6 +321,15 @@ index 8020c83..60b7361 100644
 +    fun transliterationPicksHighestPublicViews() {
 +        val pop = mapOf("VS" to popOf(760_000_000L, false, 0), "KS" to popOf(null, false, 0))
 +        assertEquals(Online.Play("VS"), decidePop("chhammak chhallo", pop, keshaw, vishal))
++    }
++
++    @Test
++    fun personalBeatsPublicViews() {
++        // Confirmed priority: liked/playlist and listening history decide before public views.
++        val savedBeatsViews = mapOf("VS" to popOf(760_000_000L, false, 0), "KS" to popOf(null, true, 0))
++        assertEquals(Online.Play("KS"), decidePop("chhammak chhallo", savedBeatsViews, vishal, keshaw))
++        val playsBeatViews = mapOf("VS" to popOf(760_000_000L, false, 0), "KS" to popOf(null, false, 3))
++        assertEquals(Online.Play("KS"), decidePop("chhammak chhallo", playsBeatViews, vishal, keshaw))
 +    }
 +
 +    @Test
@@ -382,9 +400,9 @@ index 8020c83..60b7361 100644
 +    fun viewsForRequiresSameTitleAndArtistOverlap() {
 +        val rows =
 +            listOf(
-+                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar", "Hamsika Iyer"), 760_000_000L),
-+                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Some DJ"), 999_000_000L),
-+                VoiceTitleMatcher.ViewRow("Chammak Chhallo", listOf("Keshaw Sahu"), 12_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar", "Hamsika Iyer"), 760_000_000L, "VID-VS"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Some DJ"), 999_000_000L, "VID-DJ"),
++                VoiceTitleMatcher.ViewRow("Chammak Chhallo", listOf("Keshaw Sahu"), 12_000L, "VID-KS"),
 +            )
 +        assertEquals(760_000_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
 +        assertEquals(12_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", keshaw, rows))
@@ -394,11 +412,11 @@ index 8020c83..60b7361 100644
 +    fun viewsForRefusesVariantAndLyricVideos() {
 +        val rows =
 +            listOf(
-+                VoiceTitleMatcher.ViewRow("Chammak Challo (Live)", listOf("Vishal-Shekhar"), 900_000_000L),
-+                VoiceTitleMatcher.ViewRow("Chammak Challo (Cover)", listOf("Akon"), 5_000_000L),
-+                VoiceTitleMatcher.ViewRow("Chammak Challo Lyrics Video", listOf("Akon"), 300_000_000L),
-+                VoiceTitleMatcher.ViewRow("CHAMMAK CHALLO | Anime Dance [AMV/Edit]", listOf("OximeFx"), 189_000L),
-+                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar", "Hamsika Iyer"), 760_000_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Live)", listOf("Vishal-Shekhar"), 900_000_000L, "VID-LIVE"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Cover)", listOf("Akon"), 5_000_000L, "VID-COVER"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo Lyrics Video", listOf("Akon"), 300_000_000L, "VID-LYR"),
++                VoiceTitleMatcher.ViewRow("CHAMMAK CHALLO | Anime Dance [AMV/Edit]", listOf("OximeFx"), 189_000L, "VID-AMV"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar", "Hamsika Iyer"), 760_000_000L, "VID-VS"),
 +            )
 +        // Only the plain official video donates; live/cover/lyric/AMV versions never do.
 +        assertEquals(760_000_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
@@ -408,13 +426,44 @@ index 8020c83..60b7361 100644
 +    fun onlyVariantVideosMeansViewsUnknown() {
 +        val rows =
 +            listOf(
-+                VoiceTitleMatcher.ViewRow("Chammak Challo (Slowed)", listOf("Vishal-Shekhar"), 900_000_000L),
-+                VoiceTitleMatcher.ViewRow("Chammak Challo (Lyrics)", listOf("Akon"), 300_000_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Slowed)", listOf("Vishal-Shekhar"), 900_000_000L, "VID-SLOW"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo (Lyrics)", listOf("Akon"), 300_000_000L, "VID-LYR2"),
 +            )
 +        assertEquals(null, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
 +        // Unknown views -> the personal signal decides instead of an invented popularity.
 +        val pop = mapOf("VS" to popOf(null, false, 4), "KS" to popOf(null, false, 1))
 +        assertEquals(Online.Play("VS"), decidePop("chhammak chhallo", pop, keshaw, vishal))
++    }
++
++    @Test
++    fun conflictingDonorsMeanViewsUnknown() {
++        // Official video + official audio upload, same title and artist, different counts:
++        // no proof which count belongs to the song, so views stay unknown and personal decides.
++        val rows =
++            listOf(
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar"), 760_000_000L, "VID-VS"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Vishal-Shekhar"), 48_000_000L, "VID-AUDIO"),
++            )
++        assertEquals(null, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
++        // Agreeing duplicates are fine.
++        val same =
++            listOf(
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar"), 760_000_000L, "VID-VS"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Vishal-Shekhar"), 760_000_000L, "VID-DUP"),
++            )
++        assertEquals(760_000_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, same))
++    }
++
++    @Test
++    fun ownVideoIdDonorIsAProvenBinding() {
++        // A row carrying the candidate's own videoId is the same upload: use it even when
++        // other eligible donors disagree.
++        val rows =
++            listOf(
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar"), 760_000_000L, "VID-OTHER"),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Vishal-Shekhar"), 48_000_000L, "VS"),
++            )
++        assertEquals(48_000_000L, VoiceTitleMatcher.viewsFor("chhammak chhallo", vishal, rows))
 +    }
  }
 diff --git a/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt b/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt
