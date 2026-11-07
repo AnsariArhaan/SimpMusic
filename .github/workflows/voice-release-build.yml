@@ -22,6 +22,9 @@ jobs:
       - name: Apply voice wake-word listener patch to core submodule
         run: git -C core apply ../patches/voice-wakeword-listener.patch
 
+      - name: Apply voice diagnostics (heard-text) patch to core submodule
+        run: git -C core apply ../patches/voice-diagnostics.patch
+
       - name: Fetch offline speech model (sha256-verified)
         run: |
           curl -fsSL "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" -o "$RUNNER_TEMP/vosk-model.zip"

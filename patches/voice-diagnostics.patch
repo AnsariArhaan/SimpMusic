@@ -1,0 +1,216 @@
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+index 9cfb9b8..bac97c6 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+@@ -568,9 +568,25 @@ internal class SimpleMediaSessionCallback(
+             if (voiceQuery != null) {
+                 val likedSongs = songRepository.getLikedSongs().first()
+                 // Ambiguous or unknown queries no-op: never surprise-play the wrong song.
+-                val matchIndex =
+-                    VoiceLikedSongMatcher.resolve(voiceQuery, likedSongs.map { it.title })
+-                        ?: return@future defaultResult
++                val titles = likedSongs.map { it.title }
++                val matchIndex = VoiceLikedSongMatcher.resolve(voiceQuery, titles)
++                if (matchIndex == null) {
++                    val wanted = VoiceLikedSongMatcher.cleaned(voiceQuery)
++                    val candidates = VoiceLikedSongMatcher.candidates(voiceQuery, titles)
++                    com.maxrave.media3.voice.VoiceDiagnostics.report(
++                        when {
++                            wanted.isEmpty() -> "No song name heard. Not played."
++                            candidates.size > 1 ->
++                                "Not played: ${candidates.size} liked songs contain \"$wanted\": " +
++                                    candidates.take(3).joinToString(", ") { "\"$it\"" } + ". Say more of the title."
++                            else -> "No liked song matches \"$wanted\" (checked ${titles.size} liked songs). Not played."
++                        },
++                    )
++                    return@future defaultResult
++                }
++                com.maxrave.media3.voice.VoiceDiagnostics.report(
++                    "Playing \"${titles[matchIndex]}\" from liked songs.",
++                )
+                 val matched = likedSongs[matchIndex].toTrack()
+                 mediaPlayerHandler.setQueueData(
+                     QueueData.Data(
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt
+index 7c246c5..c14c449 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcher.kt
+@@ -13,6 +13,19 @@ internal object VoiceLikedSongMatcher {
+     private val qualifier =
+         Regex("(?i)\\s+(from|in|on)\\s+(my\\s+)?(liked|favou?rite)s?( songs)?\\s*$")
+ 
++    /** The cleaned query [resolve] actually searches for (diagnostic display only). */
++    fun cleaned(query: String): String = query.trim().replace(qualifier, "").trim().lowercase()
++
++    /** Titles that contain the cleaned query (diagnostic display only; does not change [resolve]). */
++    fun candidates(
++        query: String,
++        titles: List<String>,
++    ): List<String> {
++        val wanted = cleaned(query)
++        if (wanted.isEmpty()) return emptyList()
++        return titles.filter { it.lowercase().contains(wanted) }
++    }
++
+     fun resolve(
+         query: String,
+         titles: List<String>,
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceDiagnostics.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceDiagnostics.kt
+new file mode 100644
+index 0000000..4bcb387
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceDiagnostics.kt
+@@ -0,0 +1,15 @@
++package com.maxrave.media3.voice
++
++/**
++ * Fork-added: carries a short, transient status line from the media session (which knows whether a
++ * liked song matched) to [VoiceListenService] (which shows it on screen). Text only: never stored,
++ * never audio. The sink is set while the listener service runs and cleared when it stops.
++ */
++internal object VoiceDiagnostics {
++    @Volatile
++    var sink: ((String) -> Unit)? = null
++
++    fun report(message: String) {
++        sink?.invoke(message)
++    }
++}
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index 0d8be93..cf7a28e 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -18,6 +18,7 @@ import android.os.Handler
+ import android.os.IBinder
+ import android.os.Looper
+ import android.os.PowerManager
++import android.widget.Toast
+ import androidx.core.app.NotificationCompat
+ import androidx.core.app.ServiceCompat
+ import androidx.core.content.ContextCompat
+@@ -134,33 +135,59 @@ class VoiceListenService : Service(), RecognitionListener {
+         ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+             PackageManager.PERMISSION_GRANTED
+ 
++    private var stopPending: PendingIntent? = null
++
++    private fun buildNotification(text: String): Notification =
++        NotificationCompat
++            .Builder(this, CHANNEL_ID)
++            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
++            .setContentTitle("Voice listening on")
++            .setContentText(text)
++            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
++            .setOnlyAlertOnce(true)
++            .setOngoing(true)
++            .addAction(0, "Stop", stopPending)
++            .build()
++
++    /** Fork diagnostic: shows what the recognizer heard and what happened, on screen. Transient text only. */
++    private fun showStatus(text: String) {
++        Logger.w(TAG, "status: $text")
++        handler.post {
++            if (stopping) return@post
++            try {
++                getSystemService(NotificationManager::class.java)
++                    .notify(NOTIFICATION_ID, buildNotification(text))
++            } catch (e: Exception) {
++                Logger.w(TAG, "status notify failed: ${e.message}")
++            }
++            try {
++                Toast.makeText(applicationContext, text, Toast.LENGTH_LONG).show()
++            } catch (e: Exception) {
++                Logger.w(TAG, "status toast failed: ${e.message}")
++            }
++        }
++    }
++
+     private fun startForegroundWithNotification() {
+         val nm = getSystemService(NotificationManager::class.java)
+         nm.createNotificationChannel(
+             NotificationChannel(CHANNEL_ID, "Voice listening", NotificationManager.IMPORTANCE_LOW),
+         )
+-        val stopPending =
++        stopPending =
+             PendingIntent.getService(
+                 this,
+                 0,
+                 stopIntent(this),
+                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+             )
+-        val notification: Notification =
+-            NotificationCompat
+-                .Builder(this, CHANNEL_ID)
+-                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+-                .setContentTitle("Voice listening on")
+-                .setContentText("Say \"Hey Ben\", then \"play Royalty\"")
+-                .setOngoing(true)
+-                .addAction(0, "Stop", stopPending)
+-                .build()
++        val notification: Notification = buildNotification("Say \"Hey Ben\", then \"play Royalty\"")
+         ServiceCompat.startForeground(
+             this,
+             NOTIFICATION_ID,
+             notification,
+             ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+         )
++        VoiceDiagnostics.sink = { showStatus(it) }
+     }
+ 
+     @SuppressLint("WakelockTimeout")
+@@ -216,6 +243,7 @@ class VoiceListenService : Service(), RecognitionListener {
+         lastCommandPartial = ""
+         releaseSpeech()
+         signalListening()
++        showStatus("Wake heard. Say your command now (about 6 seconds).")
+         duckPlayback()
+         val recognizer = Recognizer(m, 16000.0f)
+         speechService =
+@@ -232,7 +260,14 @@ class VoiceListenService : Service(), RecognitionListener {
+         restorePlayback()
+         val query = VoiceCommandParser.commandFrom(rawText)
+         Logger.w(TAG, "command heard: '$rawText' -> query '$query'")
+-        if (query.isNotEmpty()) playLikedQuery(query)
++        when {
++            rawText.isBlank() -> showStatus("Heard nothing after the beep. Say \"Hey Ben\" and try again.")
++            query.isEmpty() -> showStatus("Heard: \"$rawText\". Only the wake phrase, no song name.")
++            else -> {
++                showStatus("Heard: \"$rawText\". Looking for \"$query\" in liked songs...")
++                playLikedQuery(query)
++            }
++        }
+         enterWakeStage()
+     }
+ 
+@@ -380,6 +415,7 @@ class VoiceListenService : Service(), RecognitionListener {
+     private fun shutdown() {
+         if (stopping) return
+         stopping = true
++        VoiceDiagnostics.sink = null
+         restorePlayback()
+         releaseSpeech()
+         try {
+@@ -408,6 +444,7 @@ class VoiceListenService : Service(), RecognitionListener {
+     override fun onDestroy() {
+         if (!stopping) {
+             stopping = true
++            VoiceDiagnostics.sink = null
+             releaseSpeech()
+             try {
+                 model?.close()
+diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt
+index 4e027af..8ba5d9b 100644
+--- a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt
++++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceLikedSongMatcherTest.kt
+@@ -44,4 +44,11 @@ class VoiceLikedSongMatcherTest {
+     fun unknownSongDoesNotPlay() {
+         assertNull(VoiceLikedSongMatcher.resolve("unknown track from liked songs", titles))
+     }
++
++    @Test
++    fun diagnosticCandidatesListAmbiguousTitles() {
++        assertEquals(listOf("Royalty", "Royalty Free Beats", "Royals"), VoiceLikedSongMatcher.candidates("royal", titles))
++        assertEquals("royalty", VoiceLikedSongMatcher.cleaned("Royalty from liked songs"))
++        assertEquals(emptyList<String>(), VoiceLikedSongMatcher.candidates("liked songs", titles))
++    }
+ }
