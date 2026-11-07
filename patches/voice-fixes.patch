@@ -144,10 +144,10 @@ index bac97c6..62570ad 100644
              val path =
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 new file mode 100644
-index 0000000..13cc55d
+index 0000000..582c5de
 --- /dev/null
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,102 @@
 +package com.maxrave.media3.service.callback
 +
 +/**
@@ -203,11 +203,27 @@ index 0000000..13cc55d
 +        }
 +    }
 +
-+    /** True when the title equals the heard words exactly (after normalising). */
++    private val variantWords =
++        setOf(
++            "cover", "remix", "live", "karaoke", "instrumental", "slowed", "reverb", "sped", "speed", "nightcore",
++            "lofi", "mashup", "acoustic", "remastered", "version", "edit", "tribute", "8d", "bass", "boosted", "reprise",
++        )
++
++    /** True when the raw title (brackets included) carries a variant tag the user did not ask for. */
++    fun isUnaskedVariant(
++        wanted: String,
++        title: String,
++    ): Boolean {
++        val asked = wanted.split(' ').toSet()
++        val tokens = title.lowercase().split(nonWord).filter { it.isNotEmpty() }
++        return tokens.any { it in variantWords && it !in asked }
++    }
++
++    /** True when the title equals the heard words exactly (after normalising) and is not an unasked variant. */
 +    fun isExact(
 +        wanted: String,
 +        title: String,
-+    ): Boolean = wanted.isNotEmpty() && normalize(title) == wanted
++    ): Boolean = wanted.isNotEmpty() && normalize(title) == wanted && !isUnaskedVariant(wanted, title)
 +
 +    /**
 +     * Whether an online search result is a confident match for what was heard: every heard word is
@@ -221,6 +237,7 @@ index 0000000..13cc55d
 +        artists: List<String>,
 +    ): Boolean {
 +        if (wanted.length < 4) return false
++        if (isUnaskedVariant(wanted, title)) return false
 +        val heard = wanted.split(' ').filter { it.isNotEmpty() }
 +        val titleWords = normalize(title).split(' ').filter { it.isNotEmpty() }
 +        if (heard.isEmpty() || titleWords.isEmpty()) return false
@@ -234,14 +251,17 @@ index 0000000..13cc55d
 +    }
 +}
 diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
-index 9863a2e..5109971 100644
+index 9863a2e..ec233bf 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
-@@ -18,5 +18,14 @@ internal object VoiceCommandParser {
+@@ -18,5 +18,17 @@ internal object VoiceCommandParser {
  
      fun isWake(text: String): Boolean = text.lowercase().contains(WAKE_PHRASE)
  
 -    fun commandFrom(text: String): String = text.trim().replace(wakePrefix, "").replace(leadIn, "").trim()
++    /** Stricter wake acceptance: the recognised text must be exactly the wake phrase (no noise words around it). */
++    fun isWakeOnly(text: String): Boolean = text.trim().lowercase() == WAKE_PHRASE
++
 +    private val unknownMarker = Regex("(?i)\\[unk]")
 +
 +    fun commandFrom(text: String): String =
@@ -284,10 +304,15 @@ index 4bcb387..48152cc 100644
      }
  }
 diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
-index cf7a28e..ba59bb9 100644
+index cf7a28e..1fc027c 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
-@@ -18,6 +18,7 @@ import android.os.Handler
+@@ -14,10 +14,12 @@ import android.content.pm.PackageManager
+ import android.content.pm.ServiceInfo
+ import android.media.AudioManager
+ import android.media.ToneGenerator
++import android.os.Bundle
+ import android.os.Handler
  import android.os.IBinder
  import android.os.Looper
  import android.os.PowerManager
@@ -295,7 +320,7 @@ index cf7a28e..ba59bb9 100644
  import android.widget.Toast
  import androidx.core.app.NotificationCompat
  import androidx.core.app.ServiceCompat
-@@ -48,7 +49,7 @@ import org.vosk.android.StorageService
+@@ -48,7 +50,7 @@ import org.vosk.android.StorageService
   * service kill - re-enable from Settings. Continuous decoding costs battery; the partial wake lock
   * is what keeps listening alive on a locked screen.
   */
@@ -304,7 +329,7 @@ index cf7a28e..ba59bb9 100644
      companion object {
          const val ACTION_START = "com.maxrave.media3.voice.START"
          const val ACTION_STOP = "com.maxrave.media3.voice.STOP"
-@@ -56,8 +57,12 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -56,8 +58,13 @@ class VoiceListenService : Service(), RecognitionListener {
          private const val TAG = "VoiceListenService"
          private const val CHANNEL_ID = "voice_listen"
          private const val NOTIFICATION_ID = 4242
@@ -316,10 +341,11 @@ index cf7a28e..ba59bb9 100644
 +        private const val WAKE_COOLDOWN_MS = 1500L
 +        private const val END_SILENCE_S = 1.2f
 +        private const val MAX_UTTERANCE_S = 15.0f
++        private const val COMMAND_LANG = "en-IN"
  
          /** UI switch state: true only while the service is actually running. */
          val running = MutableStateFlow(false)
-@@ -76,7 +81,13 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -76,7 +83,13 @@ class VoiceListenService : Service(), RecognitionListener {
      private var speechService: SpeechService? = null
      private var wakeLock: PowerManager.WakeLock? = null
      private var controller: MediaController? = null
@@ -334,18 +360,122 @@ index cf7a28e..ba59bb9 100644
      private var lastCommandPartial = ""
      private val handler = Handler(Looper.getMainLooper())
      private var stopping = false
-@@ -86,6 +97,44 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -86,6 +99,148 @@ class VoiceListenService : Service(), RecognitionListener {
              if (stage == Stage.COMMAND) finishCommandStage(lastCommandPartial)
          }
  
 +    private var commandStart: Runnable? = null
 +
++    /** True only after the system confirmed an on-device en-IN pack is installed (checked at startup). */
++    private var onDeviceReady = false
++    private var androidRecognizer: android.speech.SpeechRecognizer? = null
++    private var engineNote = "Vosk"
++
++    @SuppressLint("NewApi")
++    private fun probeOnDevice() {
++        if (android.os.Build.VERSION.SDK_INT < 33) {
++            engineNote = "Vosk (Android too old for on-device recognizer)"
++            return
++        }
++        try {
++            if (!android.speech.SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
++                engineNote = "Vosk (no on-device recognizer on this phone)"
++                return
++            }
++            val probe = android.speech.SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
++            probe.checkRecognitionSupport(
++                commandIntent(),
++                ContextCompat.getMainExecutor(this),
++                object : android.speech.RecognitionSupportCallback {
++                    override fun onSupportResult(support: android.speech.RecognitionSupport) {
++                        val installed = support.installedOnDeviceLanguages
++                        onDeviceReady = installed.any { it.equals(COMMAND_LANG, ignoreCase = true) || it.startsWith("en-") }
++                        engineNote =
++                            if (onDeviceReady) "on-device Android ($COMMAND_LANG)" else "Vosk (en-IN pack not installed: $installed)"
++                        Logger.w(TAG, "on-device probe: ready=$onDeviceReady installed=$installed")
++                        try { probe.destroy() } catch (_: Exception) {}
++                    }
++
++                    override fun onError(error: Int) {
++                        engineNote = "Vosk (on-device check failed: $error)"
++                        Logger.w(TAG, "on-device probe error $error")
++                        try { probe.destroy() } catch (_: Exception) {}
++                    }
++                },
++            )
++        } catch (e: Throwable) {
++            engineNote = "Vosk (on-device check failed)"
++            Logger.w(TAG, "on-device probe threw: ${e.message}")
++        }
++    }
++
++    private fun commandIntent(): Intent =
++        Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
++            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
++            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, COMMAND_LANG)
++            .putExtra(android.speech.RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
++            .putExtra(android.speech.RecognizerIntent.EXTRA_MAX_RESULTS, 1)
++            .putExtra(android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
++            .putExtra(android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
++
++    /** Command stage via the system on-device recognizer. Returns false if it could not start (caller uses Vosk). */
++    @SuppressLint("NewApi")
++    private fun startAndroidRecognizer(myGen: Int): Boolean {
++        if (!onDeviceReady) return false
++        return try {
++            val r = android.speech.SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
++            r.setRecognitionListener(
++                object : android.speech.RecognitionListener {
++                    private fun live() = myGen == gen && !stopping && stage == Stage.COMMAND
++
++                    override fun onResults(results: Bundle?) {
++                        if (!live()) return
++                        val text =
++                            results
++                                ?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
++                                ?.firstOrNull()
++                                .orEmpty()
++                        finishCommandStage(text)
++                    }
++
++                    override fun onError(error: Int) {
++                        if (!live()) return
++                        Logger.w(TAG, "on-device recognizer error $error")
++                        finishCommandStage("")
++                    }
++
++                    override fun onPartialResults(partialResults: Bundle?) {
++                        if (!live()) return
++                        partialResults
++                            ?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
++                            ?.firstOrNull()
++                            ?.let { if (it.isNotEmpty()) lastCommandPartial = it }
++                    }
++
++                    override fun onReadyForSpeech(params: Bundle?) {}
++                    override fun onBeginningOfSpeech() {}
++                    override fun onRmsChanged(rmsdB: Float) {}
++                    override fun onBufferReceived(buffer: ByteArray?) {}
++                    override fun onEndOfSpeech() {}
++                    override fun onEvent(eventType: Int, params: Bundle?) {}
++                },
++            )
++            androidRecognizer = r
++            r.startListening(commandIntent().putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true))
++            handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
++            showStatus("Listening ($engineNote). Say the song name.")
++            true
++        } catch (e: Throwable) {
++            Logger.w(TAG, "on-device start failed: ${e.message}")
++            false
++        }
++    }
++
 +    private val outcomeTimeout =
 +        Runnable {
 +            if (awaitingOutcome) {
 +                awaitingOutcome = false
-+                showStatus("No result in time. Nothing played.")
-+                resumeIfPausedByUs()
++                showStatus("No result in time. Nothing played. Music stays paused.")
 +            }
 +        }
 +
@@ -379,7 +509,7 @@ index cf7a28e..ba59bb9 100644
      override fun onBind(intent: Intent?): IBinder? = null
  
      override fun onStartCommand(
-@@ -187,7 +236,7 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -187,7 +342,7 @@ class VoiceListenService : Service(), RecognitionListener {
              notification,
              ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
          )
@@ -388,7 +518,15 @@ index cf7a28e..ba59bb9 100644
      }
  
      @SuppressLint("WakelockTimeout")
-@@ -225,10 +274,11 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -201,6 +356,7 @@ class VoiceListenService : Service(), RecognitionListener {
+ 
+     private fun loadModel() {
+         stage = Stage.LOADING
++        probeOnDevice()
+         StorageService.unpack(
+             this,
+             "model-en-us",
+@@ -225,10 +381,11 @@ class VoiceListenService : Service(), RecognitionListener {
          stage = Stage.WAKE
          lastCommandPartial = ""
          val grammar = "[\"${VoiceCommandParser.WAKE_PHRASE}\", \"[unk]\"]"
@@ -403,7 +541,7 @@ index cf7a28e..ba59bb9 100644
              }
          // True only here: model unpacked and the wake recognizer is actually listening.
          running.value = true
-@@ -237,41 +287,85 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -237,41 +394,85 @@ class VoiceListenService : Service(), RecognitionListener {
  
      private fun enterCommandStage() {
          if (stopping) return
@@ -440,6 +578,8 @@ index cf7a28e..ba59bb9 100644
 +
 +    private fun startCommandRecognizer() {
 +        val m = model ?: return
++        if (startAndroidRecognizer(gen)) return
++        showStatus("Listening (Vosk fallback; $engineNote). Say the song name.")
 +        try {
 +            val rec = Recognizer(m, 16000.0f)
 +            try {
@@ -457,7 +597,7 @@ index cf7a28e..ba59bb9 100644
 +            Logger.w(TAG, "command stage listening")
 +        } catch (e: Exception) {
 +            Logger.e(TAG, "command recognizer failed: ${e.message}")
-+            resumeIfPausedByUs()
++            showStatus("Could not listen for the command. Nothing played. Music stays paused.")
 +            enterWakeStage()
 +        }
      }
@@ -475,16 +615,14 @@ index cf7a28e..ba59bb9 100644
 -            rawText.isBlank() -> showStatus("Heard nothing after the beep. Say \"Hey Ben\" and try again.")
 -            query.isEmpty() -> showStatus("Heard: \"$rawText\". Only the wake phrase, no song name.")
 +            text.isBlank() -> {
-+                showStatus("Heard nothing after the beep. Nothing played.")
-+                resumeIfPausedByUs()
++                showStatus("Heard nothing after the beep. Nothing played. Music stays paused.")
 +            }
 +            VoiceQueryGate.isCancel(query) -> {
-+                showStatus("Cancelled.")
++                showStatus("Cancelled. Resuming what was playing.")
 +                resumeIfPausedByUs()
 +            }
 +            !VoiceQueryGate.usable(query) -> {
-+                showStatus("Heard: \"$text\". Not a clear song name. Nothing played.")
-+                resumeIfPausedByUs()
++                showStatus("Heard: \"$text\". Not a clear song name. Nothing played. Music stays paused.")
 +            }
              else -> {
 -                showStatus("Heard: \"$rawText\". Looking for \"$query\" in liked songs...")
@@ -505,7 +643,7 @@ index cf7a28e..ba59bb9 100644
          val item =
              MediaItem
                  .Builder()
-@@ -282,26 +376,46 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -282,26 +483,46 @@ class VoiceListenService : Service(), RecognitionListener {
                          .setSearchQuery(query)
                          .build(),
                  ).build()
@@ -532,9 +670,9 @@ index cf7a28e..ba59bb9 100644
 +                pausedByUs = false
 +            }
 +            VoiceOutcome.NOT_PLAYED -> {
++                // Nothing chosen: stay paused. Only an explicit "cancel"/"resume" restarts old music.
 +                awaitingOutcome = false
 +                handler.removeCallbacks(outcomeTimeout)
-+                resumeIfPausedByUs()
 +            }
          }
      }
@@ -563,7 +701,7 @@ index cf7a28e..ba59bb9 100644
      }
  
      /** Connects (once) to the app's media session and runs [block] when the controller is ready. */
-@@ -341,35 +455,38 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -341,35 +562,38 @@ class VoiceListenService : Service(), RecognitionListener {
  
      // RecognitionListener (both stages share it; behavior branches on stage)
  
@@ -573,7 +711,7 @@ index cf7a28e..ba59bb9 100644
          when (stage) {
 -            Stage.WAKE -> if (VoiceCommandParser.isWake(text)) enterCommandStage()
 +            Stage.WAKE ->
-+                if (SystemClock.elapsedRealtime() >= ignoreWakeUntil && VoiceCommandParser.isWake(text)) {
++                if (SystemClock.elapsedRealtime() >= ignoreWakeUntil && VoiceCommandParser.isWakeOnly(text)) {
 +                    enterCommandStage()
 +                }
              Stage.COMMAND -> if (text.isNotEmpty()) lastCommandPartial = text
@@ -608,16 +746,16 @@ index cf7a28e..ba59bb9 100644
          Logger.w(TAG, "recognizer timeout")
          handleRecognizerFault("timeout")
      }
-@@ -381,7 +498,7 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -381,7 +605,7 @@ class VoiceListenService : Service(), RecognitionListener {
       */
      private fun handleRecognizerFault(kind: String) {
          if (stopping || stage == Stage.LOADING) return
 -        if (stage == Stage.COMMAND) restorePlayback()
-+        if (stage == Stage.COMMAND) resumeIfPausedByUs()
++        if (stage == Stage.COMMAND) showStatus("Listening problem. Nothing played. Music stays paused.")
          consecutiveErrors += 1
          if (consecutiveErrors >= VoiceStartGate.MAX_CONSECUTIVE_ERRORS) {
              Logger.e(TAG, "stopping after $consecutiveErrors consecutive recognizer ${kind}s")
-@@ -402,7 +519,12 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -402,7 +626,12 @@ class VoiceListenService : Service(), RecognitionListener {
          }
  
      private fun releaseSpeech() {
@@ -630,7 +768,7 @@ index cf7a28e..ba59bb9 100644
          try {
              speechService?.stop()
              speechService?.shutdown()
-@@ -410,13 +532,20 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -410,13 +639,26 @@ class VoiceListenService : Service(), RecognitionListener {
              Logger.w(TAG, "speech release: ${e.message}")
          }
          speechService = null
@@ -640,6 +778,13 @@ index cf7a28e..ba59bb9 100644
 +            Logger.w(TAG, "recognizer close: ${e.message}")
 +        }
 +        recognizer = null
++        try {
++            androidRecognizer?.cancel()
++            androidRecognizer?.destroy()
++        } catch (e: Throwable) {
++            Logger.w(TAG, "android recognizer release: ${e.message}")
++        }
++        androidRecognizer = null
      }
  
      private fun shutdown() {
@@ -648,11 +793,10 @@ index cf7a28e..ba59bb9 100644
          VoiceDiagnostics.sink = null
 -        restorePlayback()
 +        handler.removeCallbacks(outcomeTimeout)
-+        if (pausedByUs) controller?.let { c -> pausedByUs = false; c.play() }
          releaseSpeech()
          try {
              model?.close()
-@@ -445,6 +574,7 @@ class VoiceListenService : Service(), RecognitionListener {
+@@ -445,6 +687,7 @@ class VoiceListenService : Service(), RecognitionListener {
          if (!stopping) {
              stopping = true
              VoiceDiagnostics.sink = null
@@ -662,7 +806,7 @@ index cf7a28e..ba59bb9 100644
                  model?.close()
 diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt
 new file mode 100644
-index 0000000..ce239e4
+index 0000000..9e5d1b7
 --- /dev/null
 +++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt
 @@ -0,0 +1,32 @@
@@ -678,7 +822,7 @@ index 0000000..ce239e4
 +    private val spaces = Regex("\\s+")
 +    private val filler =
 +        setOf("the", "a", "an", "uh", "um", "umm", "hmm", "huh", "oh", "ah", "hey", "ben", "play", "and", "to", "of", "is", "it", "i")
-+    private val cancelPhrases = setOf("cancel", "never mind", "nevermind", "resume", "continue", "stop")
++    private val cancelPhrases = setOf("cancel", "never mind", "nevermind", "resume", "continue")
 +    private const val MAX_WORDS = 12
 +
 +    /** Drops the recognizer's unknown-word markers and tidies spaces. */
@@ -700,10 +844,10 @@ index 0000000..ce239e4
 +}
 diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
 new file mode 100644
-index 0000000..9f3016d
+index 0000000..a2bd98f
 --- /dev/null
 +++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,69 @@
 +package com.maxrave.media3.service.callback
 +
 +import org.junit.Assert.assertEquals
@@ -760,13 +904,25 @@ index 0000000..9f3016d
 +        assertFalse(VoiceTitleMatcher.acceptOnline("royalty", "Royalty Free Music Medley Of Many Songs Vol 3", listOf("Any")))
 +        assertFalse(VoiceTitleMatcher.acceptOnline("ben", "Ben", listOf("Michael Jackson")))
 +    }
++
++    @Test
++    fun variantsAreRejectedUnlessAsked() {
++        assertFalse(VoiceTitleMatcher.isExact("royalty", "Royalty (Cover)"))
++        assertFalse(VoiceTitleMatcher.acceptOnline("royalty", "Royalty (Slowed + Reverb)", listOf("Someone")))
++        assertTrue(VoiceTitleMatcher.isExact("royalty", "Royalty (feat. Neoni)"))
++    }
++
++    @Test
++    fun wrongArtistIsRejected() {
++        assertFalse(VoiceTitleMatcher.acceptOnline("royalty by egzod", "Royalty", listOf("Other Artist")))
++    }
 +}
 diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
 new file mode 100644
-index 0000000..eadb22e
+index 0000000..e954e5a
 --- /dev/null
 +++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,54 @@
 +package com.maxrave.media3.voice
 +
 +import org.junit.Assert.assertEquals
@@ -807,5 +963,17 @@ index 0000000..eadb22e
 +        assertTrue(VoiceQueryGate.isCancel("never mind"))
 +        assertTrue(VoiceQueryGate.isCancel("Cancel."))
 +        assertFalse(VoiceQueryGate.isCancel("cancel culture song"))
++    }
++
++    @Test
++    fun wakeOnlyIsStrict() {
++        assertTrue(VoiceCommandParser.isWakeOnly(" Hey Ben "))
++        assertFalse(VoiceCommandParser.isWakeOnly("[unk] hey ben"))
++        assertFalse(VoiceCommandParser.isWakeOnly("hey ben play"))
++    }
++
++    @Test
++    fun stopIsNotCancel() {
++        assertFalse(VoiceQueryGate.isCancel("stop"))
 +    }
 +}
