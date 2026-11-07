@@ -1,0 +1,811 @@
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+index bac97c6..62570ad 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+@@ -45,6 +45,8 @@ import com.maxrave.domain.utils.connectArtists
+ import com.maxrave.domain.utils.toArrayListTrack
+ import com.maxrave.domain.utils.toListName
+ import com.maxrave.domain.utils.toListTrack
++import com.maxrave.media3.voice.VoiceDiagnostics
++import com.maxrave.media3.voice.VoiceOutcome
+ import com.maxrave.domain.utils.toPlaylistEntity
+ import com.maxrave.domain.utils.toSongEntity
+ import com.maxrave.domain.utils.toTrack
+@@ -543,6 +545,89 @@ internal class SimpleMediaSessionCallback(
+             } ?: LibraryResult.ofError(SessionError.ERROR_UNKNOWN)
+         }
+ 
++    /**
++     * Voice request: liked songs first (strict title match), else the app's online song search with a
++     * confidence check. Anything unclear is reported and NOT played; it never falls back to the old queue.
++     */
++    private suspend fun handleVoiceQuery(voiceQuery: String) {
++        try {
++            val wanted = VoiceTitleMatcher.wantedFrom(voiceQuery)
++            val likedSongs = songRepository.getLikedSongs().first()
++            val titles = likedSongs.map { it.title }
++            when (val liked = VoiceTitleMatcher.matchLiked(wanted, titles)) {
++                is VoiceTitleMatcher.Liked.Play -> {
++                    val matched = likedSongs[liked.index].toTrack()
++                    VoiceDiagnostics.report("Playing \"${titles[liked.index]}\" from liked songs.", VoiceOutcome.PLAYED)
++                    mediaPlayerHandler.setQueueData(
++                        QueueData.Data(
++                            listTracks = likedSongs.toArrayListTrack(),
++                            firstPlayedTrack = matched,
++                            playlistId = null,
++                            playlistName = context.getString(R.string.favorites),
++                            playlistType = PlaylistType.LOCAL_PLAYLIST,
++                            continuation = null,
++                        ),
++                    )
++                    mediaPlayerHandler.loadMediaItem(matched, Config.PLAYLIST_CLICK, liked.index)
++                    return
++                }
++
++                is VoiceTitleMatcher.Liked.Ambiguous -> {
++                    val names = liked.indexes.take(3).joinToString(", ") { "\"${titles[it]}\"" }
++                    VoiceDiagnostics.report(
++                        "Not played: ${liked.indexes.size} liked songs match \"$wanted\": $names. Say more of the title.",
++                        VoiceOutcome.NOT_PLAYED,
++                    )
++                    return
++                }
++
++                VoiceTitleMatcher.Liked.None -> {}
++            }
++            if (wanted.length < 4) {
++                VoiceDiagnostics.report("Not played: \"$wanted\" is too short to search safely.", VoiceOutcome.NOT_PLAYED)
++                return
++            }
++            VoiceDiagnostics.report("Not in liked songs. Searching online for \"$wanted\"...", VoiceOutcome.PROGRESS)
++            val results: List<Track> =
++                searchRepository.getSearchDataSong(wanted).lastOrNull()?.let { resource ->
++                    when (resource) {
++                        is Resource.Success -> resource.data?.toListTrack() ?: emptyList()
++                        else -> null
++                    }
++                } ?: run {
++                    VoiceDiagnostics.report("Not played: online search failed (no network?).", VoiceOutcome.NOT_PLAYED)
++                    return
++                }
++            val top = results.filter { it.isAvailable }.take(5)
++            val pick =
++                top.firstOrNull { VoiceTitleMatcher.isExact(wanted, it.title) }
++                    ?: top.firstOrNull { VoiceTitleMatcher.acceptOnline(wanted, it.title, it.artists?.mapNotNull { a -> a.name } ?: emptyList()) }
++            if (pick == null) {
++                val seen = top.take(2).joinToString(", ") { "\"${it.title}\"" }
++                VoiceDiagnostics.report(
++                    "Not played: no confident match online for \"$wanted\"." + if (seen.isNotEmpty()) " Top results: $seen." else "",
++                    VoiceOutcome.NOT_PLAYED,
++                )
++                return
++            }
++            VoiceDiagnostics.report("Playing \"${pick.title}\" (online search).", VoiceOutcome.PLAYED)
++            mediaPlayerHandler.setQueueData(
++                QueueData.Data(
++                    listTracks = arrayListOf(pick),
++                    firstPlayedTrack = pick,
++                    playlistId = "RDAMVM${pick.videoId}",
++                    playlistName = "\"${pick.title}\" Radio",
++                    playlistType = PlaylistType.RADIO,
++                    continuation = null,
++                ),
++            )
++            mediaPlayerHandler.loadMediaItem(pick, Config.SONG_CLICK, 0)
++        } catch (e: Exception) {
++            if (e is kotlinx.coroutines.CancellationException) throw e
++            VoiceDiagnostics.report("Not played: voice request failed (${e.message}).", VoiceOutcome.NOT_PLAYED)
++        }
++    }
++
+     @UnstableApi
+     override fun onSetMediaItems(
+         mediaSession: MediaSession,
+@@ -566,39 +651,7 @@ internal class SimpleMediaSessionCallback(
+                     ?.trim()
+                     ?.takeIf { it.isNotEmpty() }
+             if (voiceQuery != null) {
+-                val likedSongs = songRepository.getLikedSongs().first()
+-                // Ambiguous or unknown queries no-op: never surprise-play the wrong song.
+-                val titles = likedSongs.map { it.title }
+-                val matchIndex = VoiceLikedSongMatcher.resolve(voiceQuery, titles)
+-                if (matchIndex == null) {
+-                    val wanted = VoiceLikedSongMatcher.cleaned(voiceQuery)
+-                    val candidates = VoiceLikedSongMatcher.candidates(voiceQuery, titles)
+-                    com.maxrave.media3.voice.VoiceDiagnostics.report(
+-                        when {
+-                            wanted.isEmpty() -> "No song name heard. Not played."
+-                            candidates.size > 1 ->
+-                                "Not played: ${candidates.size} liked songs contain \"$wanted\": " +
+-                                    candidates.take(3).joinToString(", ") { "\"$it\"" } + ". Say more of the title."
+-                            else -> "No liked song matches \"$wanted\" (checked ${titles.size} liked songs). Not played."
+-                        },
+-                    )
+-                    return@future defaultResult
+-                }
+-                com.maxrave.media3.voice.VoiceDiagnostics.report(
+-                    "Playing \"${titles[matchIndex]}\" from liked songs.",
+-                )
+-                val matched = likedSongs[matchIndex].toTrack()
+-                mediaPlayerHandler.setQueueData(
+-                    QueueData.Data(
+-                        listTracks = likedSongs.toArrayListTrack(),
+-                        firstPlayedTrack = matched,
+-                        playlistId = null,
+-                        playlistName = context.getString(R.string.favorites),
+-                        playlistType = PlaylistType.LOCAL_PLAYLIST,
+-                        continuation = null,
+-                    ),
+-                )
+-                mediaPlayerHandler.loadMediaItem(matched, Config.PLAYLIST_CLICK, matchIndex)
++                handleVoiceQuery(voiceQuery)
+                 return@future defaultResult
+             }
+             val path =
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+new file mode 100644
+index 0000000..13cc55d
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+@@ -0,0 +1,85 @@
++package com.maxrave.media3.service.callback
++
++/**
++ * Title matching for spoken song requests. Pure Kotlin so it is unit-testable on the JVM.
++ * Fail closed: ambiguous or weak matches never play; they are reported instead.
++ */
++internal object VoiceTitleMatcher {
++    sealed interface Liked {
++        data class Play(
++            val index: Int,
++        ) : Liked
++
++        data class Ambiguous(
++            val indexes: List<Int>,
++        ) : Liked
++
++        object None : Liked
++    }
++
++    private val qualifier = Regex("(?i)\\s+(from|in|on)\\s+(my\\s+)?(liked|favou?rite)s?( songs)?\\s*$")
++    private val bracketed = Regex("[(\\[][^)\\]]*[)\\]]")
++    private val nonWord = Regex("[^\\p{L}\\p{N}]+")
++    private val allowedExtra = setOf("by", "from", "song", "the", "a")
++
++    /** Lower-case words only: brackets (feat., remix tags) and punctuation removed. */
++    fun normalize(text: String): String =
++        text
++            .replace(bracketed, " ")
++            .lowercase()
++            .replace(nonWord, " ")
++            .trim()
++
++    /** The words to search for, without a trailing "from liked songs" qualifier. */
++    fun wantedFrom(query: String): String = normalize(query.trim().replace(qualifier, ""))
++
++    fun matchLiked(
++        wanted: String,
++        titles: List<String>,
++    ): Liked {
++        if (wanted.isEmpty()) return Liked.None
++        val normalized = titles.map { normalize(it) }
++        val exact = normalized.indices.filter { normalized[it] == wanted }
++        if (exact.size == 1) return Liked.Play(exact[0])
++        if (exact.size > 1) return Liked.Ambiguous(exact.take(5))
++        // Very short text is too easy to produce from noise: only a whole-title match may play.
++        if (wanted.length < 4) return Liked.None
++        val padded = " $wanted "
++        val part = normalized.indices.filter { " ${normalized[it]} ".contains(padded) }
++        return when (part.size) {
++            0 -> Liked.None
++            1 -> Liked.Play(part[0])
++            else -> Liked.Ambiguous(part.take(5))
++        }
++    }
++
++    /** True when the title equals the heard words exactly (after normalising). */
++    fun isExact(
++        wanted: String,
++        title: String,
++    ): Boolean = wanted.isNotEmpty() && normalize(title) == wanted
++
++    /**
++     * Whether an online search result is a confident match for what was heard: every heard word is
++     * explained by the title, the artist names or a small set of connecting words, at least one is in
++     * the title, and the title is not much longer than the heard words (so a long remix or medley
++     * title does not pass on one shared word).
++     */
++    fun acceptOnline(
++        wanted: String,
++        title: String,
++        artists: List<String>,
++    ): Boolean {
++        if (wanted.length < 4) return false
++        val heard = wanted.split(' ').filter { it.isNotEmpty() }
++        val titleWords = normalize(title).split(' ').filter { it.isNotEmpty() }
++        if (heard.isEmpty() || titleWords.isEmpty()) return false
++        val titleSet = titleWords.toSet()
++        val artistWords = artists.flatMap { normalize(it).split(' ') }.filter { it.isNotEmpty() }.toSet()
++        val explained = titleSet + artistWords + allowedExtra
++        if (!heard.all { it in explained }) return false
++        val inTitle = heard.count { it in titleSet }
++        if (inTitle == 0) return false
++        return inTitle.toDouble() / titleWords.size >= 0.5
++    }
++}
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
+index 9863a2e..5109971 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceCommandParser.kt
+@@ -18,5 +18,14 @@ internal object VoiceCommandParser {
+ 
+     fun isWake(text: String): Boolean = text.lowercase().contains(WAKE_PHRASE)
+ 
+-    fun commandFrom(text: String): String = text.trim().replace(wakePrefix, "").replace(leadIn, "").trim()
++    private val unknownMarker = Regex("(?i)\\[unk]")
++
++    fun commandFrom(text: String): String =
++        text
++            .replace(unknownMarker, " ")
++            .replace(Regex("\\s+"), " ")
++            .trim()
++            .replace(wakePrefix, "")
++            .replace(leadIn, "")
++            .trim()
+ }
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceDiagnostics.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceDiagnostics.kt
+index 4bcb387..48152cc 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceDiagnostics.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceDiagnostics.kt
+@@ -1,15 +1,21 @@
+ package com.maxrave.media3.voice
+ 
++/** What the media session did with a voice query (shown on screen, and used to decide pause/resume). */
++internal enum class VoiceOutcome { PROGRESS, PLAYED, NOT_PLAYED }
++
+ /**
+  * Fork-added: carries a short, transient status line from the media session (which knows whether a
+- * liked song matched) to [VoiceListenService] (which shows it on screen). Text only: never stored,
++ * song matched) to [VoiceListenService] (which shows it on screen). Text only: never stored,
+  * never audio. The sink is set while the listener service runs and cleared when it stops.
+  */
+ internal object VoiceDiagnostics {
+     @Volatile
+-    var sink: ((String) -> Unit)? = null
++    var sink: ((String, VoiceOutcome) -> Unit)? = null
+ 
+-    fun report(message: String) {
+-        sink?.invoke(message)
++    fun report(
++        message: String,
++        outcome: VoiceOutcome,
++    ) {
++        sink?.invoke(message, outcome)
+     }
+ }
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index cf7a28e..ba59bb9 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -18,6 +18,7 @@ import android.os.Handler
+ import android.os.IBinder
+ import android.os.Looper
+ import android.os.PowerManager
++import android.os.SystemClock
+ import android.widget.Toast
+ import androidx.core.app.NotificationCompat
+ import androidx.core.app.ServiceCompat
+@@ -48,7 +49,7 @@ import org.vosk.android.StorageService
+  * service kill - re-enable from Settings. Continuous decoding costs battery; the partial wake lock
+  * is what keeps listening alive on a locked screen.
+  */
+-class VoiceListenService : Service(), RecognitionListener {
++class VoiceListenService : Service() {
+     companion object {
+         const val ACTION_START = "com.maxrave.media3.voice.START"
+         const val ACTION_STOP = "com.maxrave.media3.voice.STOP"
+@@ -56,8 +57,12 @@ class VoiceListenService : Service(), RecognitionListener {
+         private const val TAG = "VoiceListenService"
+         private const val CHANNEL_ID = "voice_listen"
+         private const val NOTIFICATION_ID = 4242
+-        private const val COMMAND_TIMEOUT_MS = 6000L
+-        private const val DUCK_VOLUME = 0.25f
++        private const val COMMAND_TIMEOUT_MS = 9000L
++        private const val COMMAND_START_DELAY_MS = 350L
++        private const val OUTCOME_TIMEOUT_MS = 20000L
++        private const val WAKE_COOLDOWN_MS = 1500L
++        private const val END_SILENCE_S = 1.2f
++        private const val MAX_UTTERANCE_S = 15.0f
+ 
+         /** UI switch state: true only while the service is actually running. */
+         val running = MutableStateFlow(false)
+@@ -76,7 +81,13 @@ class VoiceListenService : Service(), RecognitionListener {
+     private var speechService: SpeechService? = null
+     private var wakeLock: PowerManager.WakeLock? = null
+     private var controller: MediaController? = null
+-    private var duckedVolume: Float? = null
++    private var pausedByUs = false
++    private var awaitingOutcome = false
++    private var ignoreWakeUntil = 0L
++
++    /** Bumped on every release; a recognizer's callbacks are only honoured while their id is current. */
++    private var gen = 0
++    private var recognizer: Recognizer? = null
+     private var lastCommandPartial = ""
+     private val handler = Handler(Looper.getMainLooper())
+     private var stopping = false
+@@ -86,6 +97,44 @@ class VoiceListenService : Service(), RecognitionListener {
+             if (stage == Stage.COMMAND) finishCommandStage(lastCommandPartial)
+         }
+ 
++    private var commandStart: Runnable? = null
++
++    private val outcomeTimeout =
++        Runnable {
++            if (awaitingOutcome) {
++                awaitingOutcome = false
++                showStatus("No result in time. Nothing played.")
++                resumeIfPausedByUs()
++            }
++        }
++
++    /** Forwards a recognizer's callbacks only while it is still the current session (see [gen]). */
++    private inner class SessionListener(
++        private val id: Int,
++    ) : RecognitionListener {
++        private fun live() = id == gen && !stopping
++
++        override fun onPartialResult(hypothesis: String?) {
++            if (live()) this@VoiceListenService.onPartialResult(hypothesis)
++        }
++
++        override fun onResult(hypothesis: String?) {
++            if (live()) this@VoiceListenService.onResult(hypothesis)
++        }
++
++        override fun onFinalResult(hypothesis: String?) {
++            if (live()) this@VoiceListenService.onFinalResult(hypothesis)
++        }
++
++        override fun onError(exception: Exception?) {
++            if (live()) this@VoiceListenService.onError(exception)
++        }
++
++        override fun onTimeout() {
++            if (live()) this@VoiceListenService.onTimeout()
++        }
++    }
++
+     override fun onBind(intent: Intent?): IBinder? = null
+ 
+     override fun onStartCommand(
+@@ -187,7 +236,7 @@ class VoiceListenService : Service(), RecognitionListener {
+             notification,
+             ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+         )
+-        VoiceDiagnostics.sink = { showStatus(it) }
++        VoiceDiagnostics.sink = { message, outcome -> handler.post { onVoiceOutcome(message, outcome) } }
+     }
+ 
+     @SuppressLint("WakelockTimeout")
+@@ -225,10 +274,11 @@ class VoiceListenService : Service(), RecognitionListener {
+         stage = Stage.WAKE
+         lastCommandPartial = ""
+         val grammar = "[\"${VoiceCommandParser.WAKE_PHRASE}\", \"[unk]\"]"
+-        val recognizer = Recognizer(m, 16000.0f, grammar)
++        val rec = Recognizer(m, 16000.0f, grammar)
++        recognizer = rec
+         speechService =
+-            SpeechService(recognizer, 16000.0f).also {
+-                it.startListening(this)
++            SpeechService(rec, 16000.0f).also {
++                it.startListening(SessionListener(gen))
+             }
+         // True only here: model unpacked and the wake recognizer is actually listening.
+         running.value = true
+@@ -237,41 +287,85 @@ class VoiceListenService : Service(), RecognitionListener {
+ 
+     private fun enterCommandStage() {
+         if (stopping) return
+-        val m = model ?: return
++        if (model == null) return
+         consecutiveErrors = 0
+         stage = Stage.COMMAND
+         lastCommandPartial = ""
+         releaseSpeech()
++        // Pause (instead of lowering the volume) so the mic does not hear the music while the
++        // command is captured. Only what we paused is restored, and only if no voice-chosen track starts.
++        pauseForListening()
+         signalListening()
+-        showStatus("Wake heard. Say your command now (about 6 seconds).")
+-        duckPlayback()
+-        val recognizer = Recognizer(m, 16000.0f)
+-        speechService =
+-            SpeechService(recognizer, 16000.0f).also {
+-                it.startListening(this)
++        showStatus("Wake heard. Paused. Say the song name after the beep.")
++        val myGen = gen
++        val starter =
++            Runnable {
++                commandStart = null
++                if (stopping || stage != Stage.COMMAND || gen != myGen) return@Runnable
++                startCommandRecognizer()
+             }
+-        handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
+-        Logger.w(TAG, "command stage listening")
++        commandStart = starter
++        // The recorder starts after the beep so the beep itself is not decoded as speech.
++        handler.postDelayed(starter, COMMAND_START_DELAY_MS)
++    }
++
++    private fun startCommandRecognizer() {
++        val m = model ?: return
++        try {
++            val rec = Recognizer(m, 16000.0f)
++            try {
++                // Longer end-of-speech silence so a natural pause does not end the command early.
++                rec.setEndpointerDelays(5.0f, END_SILENCE_S, MAX_UTTERANCE_S)
++            } catch (e: Throwable) {
++                Logger.w(TAG, "endpointer delays unavailable: ${e.message}")
++            }
++            recognizer = rec
++            speechService =
++                SpeechService(rec, 16000.0f).also {
++                    it.startListening(SessionListener(gen))
++                }
++            handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
++            Logger.w(TAG, "command stage listening")
++        } catch (e: Exception) {
++            Logger.e(TAG, "command recognizer failed: ${e.message}")
++            resumeIfPausedByUs()
++            enterWakeStage()
++        }
+     }
+ 
+     private fun finishCommandStage(rawText: String) {
+         if (stage != Stage.COMMAND) return
+         handler.removeCallbacks(commandTimeout)
+-        restorePlayback()
+-        val query = VoiceCommandParser.commandFrom(rawText)
++        ignoreWakeUntil = SystemClock.elapsedRealtime() + WAKE_COOLDOWN_MS
++        val text = VoiceQueryGate.clean(rawText)
++        val query = VoiceQueryGate.clean(VoiceCommandParser.commandFrom(text))
+         Logger.w(TAG, "command heard: '$rawText' -> query '$query'")
+         when {
+-            rawText.isBlank() -> showStatus("Heard nothing after the beep. Say \"Hey Ben\" and try again.")
+-            query.isEmpty() -> showStatus("Heard: \"$rawText\". Only the wake phrase, no song name.")
++            text.isBlank() -> {
++                showStatus("Heard nothing after the beep. Nothing played.")
++                resumeIfPausedByUs()
++            }
++            VoiceQueryGate.isCancel(query) -> {
++                showStatus("Cancelled.")
++                resumeIfPausedByUs()
++            }
++            !VoiceQueryGate.usable(query) -> {
++                showStatus("Heard: \"$text\". Not a clear song name. Nothing played.")
++                resumeIfPausedByUs()
++            }
+             else -> {
+-                showStatus("Heard: \"$rawText\". Looking for \"$query\" in liked songs...")
+-                playLikedQuery(query)
++                showStatus("Heard: \"$text\". Looking for \"$query\"...")
++                awaitingOutcome = true
++                handler.removeCallbacks(outcomeTimeout)
++                handler.postDelayed(outcomeTimeout, OUTCOME_TIMEOUT_MS)
++                sendQuery(query)
+             }
+         }
+         enterWakeStage()
+     }
+ 
+-    private fun playLikedQuery(query: String) {
++    /** The media session decides what (if anything) plays; this only hands over the heard text. */
++    private fun sendQuery(query: String) {
+         val item =
+             MediaItem
+                 .Builder()
+@@ -282,26 +376,46 @@ class VoiceListenService : Service(), RecognitionListener {
+                         .setSearchQuery(query)
+                         .build(),
+                 ).build()
+-        withController { c ->
+-            c.setMediaItem(item)
+-            c.prepare()
+-            c.play()
++        withController { c -> c.setMediaItem(item) }
++    }
++
++    /** Result from the media session: progress text, a track started, or a clear reason nothing did. */
++    private fun onVoiceOutcome(
++        message: String,
++        outcome: VoiceOutcome,
++    ) {
++        if (stopping) return
++        showStatus(message)
++        if (!awaitingOutcome) return
++        when (outcome) {
++            VoiceOutcome.PROGRESS -> {}
++            VoiceOutcome.PLAYED -> {
++                awaitingOutcome = false
++                handler.removeCallbacks(outcomeTimeout)
++                pausedByUs = false
++            }
++            VoiceOutcome.NOT_PLAYED -> {
++                awaitingOutcome = false
++                handler.removeCallbacks(outcomeTimeout)
++                resumeIfPausedByUs()
++            }
+         }
+     }
+ 
+-    private fun duckPlayback() {
++    private fun pauseForListening() {
+         withController { c ->
+             if (c.isPlaying) {
+-                duckedVolume = c.volume
+-                c.volume = DUCK_VOLUME
++                c.pause()
++                pausedByUs = true
+             }
+         }
+     }
+ 
+-    private fun restorePlayback() {
+-        val back = duckedVolume ?: return
+-        duckedVolume = null
+-        withController { c -> c.volume = back }
++    /** Puts back only what this listener paused itself; never starts anything that was not playing. */
++    private fun resumeIfPausedByUs() {
++        if (!pausedByUs) return
++        pausedByUs = false
++        withController { c -> c.play() }
+     }
+ 
+     /** Connects (once) to the app's media session and runs [block] when the controller is ready. */
+@@ -341,35 +455,38 @@ class VoiceListenService : Service(), RecognitionListener {
+ 
+     // RecognitionListener (both stages share it; behavior branches on stage)
+ 
+-    override fun onPartialResult(hypothesis: String?) {
++    private fun onPartialResult(hypothesis: String?) {
+         val text = extractText(hypothesis, "partial")
+         when (stage) {
+-            Stage.WAKE -> if (VoiceCommandParser.isWake(text)) enterCommandStage()
++            Stage.WAKE ->
++                if (SystemClock.elapsedRealtime() >= ignoreWakeUntil && VoiceCommandParser.isWake(text)) {
++                    enterCommandStage()
++                }
+             Stage.COMMAND -> if (text.isNotEmpty()) lastCommandPartial = text
+             else -> {}
+         }
+     }
+ 
+-    override fun onResult(hypothesis: String?) {
++    private fun onResult(hypothesis: String?) {
+         if (stage == Stage.COMMAND) {
+             val text = extractText(hypothesis, "text")
+             if (text.isNotEmpty()) finishCommandStage(text)
+         }
+     }
+ 
+-    override fun onFinalResult(hypothesis: String?) {
++    private fun onFinalResult(hypothesis: String?) {
+         if (stage == Stage.COMMAND) {
+             val text = extractText(hypothesis, "text")
+             finishCommandStage(if (text.isNotEmpty()) text else lastCommandPartial)
+         }
+     }
+ 
+-    override fun onError(exception: Exception?) {
++    private fun onError(exception: Exception?) {
+         Logger.e(TAG, "recognizer error: ${exception?.message}")
+         handleRecognizerFault("error")
+     }
+ 
+-    override fun onTimeout() {
++    private fun onTimeout() {
+         Logger.w(TAG, "recognizer timeout")
+         handleRecognizerFault("timeout")
+     }
+@@ -381,7 +498,7 @@ class VoiceListenService : Service(), RecognitionListener {
+      */
+     private fun handleRecognizerFault(kind: String) {
+         if (stopping || stage == Stage.LOADING) return
+-        if (stage == Stage.COMMAND) restorePlayback()
++        if (stage == Stage.COMMAND) resumeIfPausedByUs()
+         consecutiveErrors += 1
+         if (consecutiveErrors >= VoiceStartGate.MAX_CONSECUTIVE_ERRORS) {
+             Logger.e(TAG, "stopping after $consecutiveErrors consecutive recognizer ${kind}s")
+@@ -402,7 +519,12 @@ class VoiceListenService : Service(), RecognitionListener {
+         }
+ 
+     private fun releaseSpeech() {
++        // Invalidate the old recognizer's callbacks first: SpeechService.stop() makes its thread post
++        // one last onFinalResult after this returns, which must never be read as the next stage's text.
++        gen += 1
+         handler.removeCallbacks(commandTimeout)
++        commandStart?.let { handler.removeCallbacks(it) }
++        commandStart = null
+         try {
+             speechService?.stop()
+             speechService?.shutdown()
+@@ -410,13 +532,20 @@ class VoiceListenService : Service(), RecognitionListener {
+             Logger.w(TAG, "speech release: ${e.message}")
+         }
+         speechService = null
++        try {
++            recognizer?.close()
++        } catch (e: Exception) {
++            Logger.w(TAG, "recognizer close: ${e.message}")
++        }
++        recognizer = null
+     }
+ 
+     private fun shutdown() {
+         if (stopping) return
+         stopping = true
+         VoiceDiagnostics.sink = null
+-        restorePlayback()
++        handler.removeCallbacks(outcomeTimeout)
++        if (pausedByUs) controller?.let { c -> pausedByUs = false; c.play() }
+         releaseSpeech()
+         try {
+             model?.close()
+@@ -445,6 +574,7 @@ class VoiceListenService : Service(), RecognitionListener {
+         if (!stopping) {
+             stopping = true
+             VoiceDiagnostics.sink = null
++            handler.removeCallbacks(outcomeTimeout)
+             releaseSpeech()
+             try {
+                 model?.close()
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt
+new file mode 100644
+index 0000000..ce239e4
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceQueryGate.kt
+@@ -0,0 +1,32 @@
++package com.maxrave.media3.voice
++
++/**
++ * Content checks on recognised text before anything is allowed to play. Pure Kotlin so it is
++ * unit-testable on the JVM. Fail closed: when the text does not look like a song request, the
++ * answer is "do nothing", never "guess".
++ */
++internal object VoiceQueryGate {
++    private val unk = Regex("(?i)\\[unk]")
++    private val spaces = Regex("\\s+")
++    private val filler =
++        setOf("the", "a", "an", "uh", "um", "umm", "hmm", "huh", "oh", "ah", "hey", "ben", "play", "and", "to", "of", "is", "it", "i")
++    private val cancelPhrases = setOf("cancel", "never mind", "nevermind", "resume", "continue", "stop")
++    private const val MAX_WORDS = 12
++
++    /** Drops the recognizer's unknown-word markers and tidies spaces. */
++    fun clean(text: String): String = text.replace(unk, " ").replace(spaces, " ").trim()
++
++    fun isCancel(query: String): Boolean = clean(query).lowercase().trimEnd('.', '!', '?') in cancelPhrases
++
++    /**
++     * True when [query] could plausibly be a song request: not empty, not a long run of noise, and
++     * at least one real word that is not just a filler word. A single title such as "Royalty" passes.
++     */
++    fun usable(query: String): Boolean {
++        val words = clean(query).split(' ').filter { it.isNotEmpty() }
++        if (words.isEmpty() || words.size > MAX_WORDS) return false
++        return words.any { w ->
++            w.lowercase() !in filler && w.count { it.isLetterOrDigit() } >= 2
++        }
++    }
++}
+diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
+new file mode 100644
+index 0000000..9f3016d
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
+@@ -0,0 +1,57 @@
++package com.maxrave.media3.service.callback
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class VoiceTitleMatcherTest {
++    private val liked = listOf("Royalty (feat. Chris)", "Chammak Challo", "Blinding Lights", "Blinding Lights (Remix)", "Believer")
++
++    @Test
++    fun normalizeDropsBracketsAndPunctuation() {
++        assertEquals("royalty", VoiceTitleMatcher.normalize("Royalty (feat. Chris)"))
++        assertEquals("don t stop", VoiceTitleMatcher.normalize("Don't Stop!"))
++    }
++
++    @Test
++    fun qualifierIsStripped() {
++        assertEquals("royalty", VoiceTitleMatcher.wantedFrom("Royalty from my liked songs"))
++    }
++
++    @Test
++    fun singleWordTitleMatchesExactly() {
++        assertEquals(VoiceTitleMatcher.Liked.Play(0), VoiceTitleMatcher.matchLiked("royalty", liked))
++    }
++
++    @Test
++    fun exactBeatsContains() {
++        assertEquals(VoiceTitleMatcher.Liked.Play(2), VoiceTitleMatcher.matchLiked("blinding lights", liked))
++    }
++
++    @Test
++    fun ambiguousPartIsNotPlayed() {
++        val r = VoiceTitleMatcher.matchLiked("lights", listOf("Blinding Lights", "City Lights"))
++        assertTrue(r is VoiceTitleMatcher.Liked.Ambiguous)
++    }
++
++    @Test
++    fun unknownAndTooShortNeverPlay() {
++        assertEquals(VoiceTitleMatcher.Liked.None, VoiceTitleMatcher.matchLiked("phonk", liked))
++        assertEquals(VoiceTitleMatcher.Liked.None, VoiceTitleMatcher.matchLiked("", liked))
++        assertEquals(VoiceTitleMatcher.Liked.None, VoiceTitleMatcher.matchLiked("ben", listOf("Ben 10 Theme")))
++    }
++
++    @Test
++    fun onlineAcceptsClearMatch() {
++        assertTrue(VoiceTitleMatcher.acceptOnline("chammak challo", "Chammak Challo", listOf("Akon")))
++        assertTrue(VoiceTitleMatcher.acceptOnline("royalty by egzod", "Royalty (feat. Neoni)", listOf("EGZOD", "Maestro Chives")))
++    }
++
++    @Test
++    fun onlineRejectsUnrelatedAndLongTitles() {
++        assertFalse(VoiceTitleMatcher.acceptOnline("chammak challo", "Phonk Drift Mix", listOf("DJ X")))
++        assertFalse(VoiceTitleMatcher.acceptOnline("royalty", "Royalty Free Music Medley Of Many Songs Vol 3", listOf("Any")))
++        assertFalse(VoiceTitleMatcher.acceptOnline("ben", "Ben", listOf("Michael Jackson")))
++    }
++}
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
+new file mode 100644
+index 0000000..eadb22e
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
+@@ -0,0 +1,42 @@
++package com.maxrave.media3.voice
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class VoiceQueryGateTest {
++    @Test
++    fun cleanStripsUnknownMarkers() {
++        assertEquals("royalty", VoiceQueryGate.clean("[unk] royalty [unk]"))
++        assertEquals("", VoiceQueryGate.clean("[unk] [UNK]"))
++    }
++
++    @Test
++    fun parserStripsUnknownBeforeWake() {
++        assertEquals("royalty", VoiceCommandParser.commandFrom("[unk] hey ben play royalty"))
++        assertEquals("", VoiceCommandParser.commandFrom("[unk]"))
++    }
++
++    @Test
++    fun singleWordTitleIsUsable() {
++        assertTrue(VoiceQueryGate.usable("royalty"))
++        assertTrue(VoiceQueryGate.usable("chammak challo"))
++    }
++
++    @Test
++    fun noiseAndFillerAreNotUsable() {
++        assertFalse(VoiceQueryGate.usable(""))
++        assertFalse(VoiceQueryGate.usable("[unk]"))
++        assertFalse(VoiceQueryGate.usable("the"))
++        assertFalse(VoiceQueryGate.usable("uh um"))
++        assertFalse(VoiceQueryGate.usable("a b c d e f g h i j k l m n"))
++    }
++
++    @Test
++    fun cancelWords() {
++        assertTrue(VoiceQueryGate.isCancel("never mind"))
++        assertTrue(VoiceQueryGate.isCancel("Cancel."))
++        assertFalse(VoiceQueryGate.isCancel("cancel culture song"))
++    }
++}

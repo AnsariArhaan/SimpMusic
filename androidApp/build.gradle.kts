@@ -96,7 +96,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             applicationIdSuffix = ".dev"
-            versionNameSuffix = "-voice7"
+            versionNameSuffix = "-voice8"
             signingConfig = signingConfigs.getByName("voiceTest")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -114,7 +114,7 @@ android {
         debug {
             isMinifyEnabled = false
             applicationIdSuffix = ".dev"
-            versionNameSuffix = "-voice7"
+            versionNameSuffix = "-voice8"
         }
     }
     compileOptions {
