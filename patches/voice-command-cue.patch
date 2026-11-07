@@ -1,0 +1,166 @@
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index baed475..8d52c12 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -63,6 +63,7 @@ class VoiceListenService : Service() {
+         private const val OUTCOME_TIMEOUT_MS = 20000L
+         private const val WAKE_COOLDOWN_MS = 1500L
+         private const val HEALTH_TICK_MS = 3000L
++        private const val CUE_FALLBACK_MS = 1500L
+         private const val END_SILENCE_S = 1.2f
+         private const val MAX_UTTERANCE_S = 15.0f
+         private const val COMMAND_LANG = "en-IN"
+@@ -110,6 +111,12 @@ class VoiceListenService : Service() {
+     private var androidRecognizer: android.speech.SpeechRecognizer? = null
+     private var engineNote = "Vosk"
+ 
++    /** Which command engine was started for the current command, shown in "Last command". */
++    private var commandEngine = "not started"
++    private var commandError = ""
++    private var cueDone = false
++    private val cueFallback = Runnable { playCueOnce("fallback: no onReadyForSpeech after 1.5 s") }
++
+     @SuppressLint("NewApi")
+     private fun probeOnDevice() {
+         if (android.os.Build.VERSION.SDK_INT < 33) {
+@@ -150,7 +157,7 @@ class VoiceListenService : Service() {
+ 
+     private fun commandIntent(): Intent =
+         Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+-            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
++            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_WEB_SEARCH)
+             .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, COMMAND_LANG)
+             .putExtra(android.speech.RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+             .putExtra(android.speech.RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+@@ -180,6 +187,7 @@ class VoiceListenService : Service() {
+                     override fun onError(error: Int) {
+                         if (!live()) return
+                         Logger.w(TAG, "on-device recognizer error $error")
++                        commandError = "on-device error code $error"
+                         finishCommandStage("")
+                     }
+ 
+@@ -191,7 +199,9 @@ class VoiceListenService : Service() {
+                             ?.let { if (it.isNotEmpty()) lastCommandPartial = it }
+                     }
+ 
+-                    override fun onReadyForSpeech(params: Bundle?) {}
++                    override fun onReadyForSpeech(params: Bundle?) {
++                        if (live()) playCueOnce("onReadyForSpeech")
++                    }
+                     override fun onBeginningOfSpeech() {}
+                     override fun onRmsChanged(rmsdB: Float) {}
+                     override fun onBufferReceived(buffer: ByteArray?) {}
+@@ -202,6 +212,8 @@ class VoiceListenService : Service() {
+             androidRecognizer = r
+             r.startListening(commandIntent().putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true))
+             handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
++            commandEngine = "on-device Android ($COMMAND_LANG), web-search language model requested"
++            handler.postDelayed(cueFallback, CUE_FALLBACK_MS)
+             showStatus("Listening ($engineNote). Say the song name.")
+             true
+         } catch (e: Throwable) {
+@@ -455,7 +467,10 @@ class VoiceListenService : Service() {
+         // Pause (instead of lowering the volume) so the mic does not hear the music while the
+         // command is captured. Only what we paused is restored, and only if no voice-chosen track starts.
+         pauseForListening()
+-        signalListening()
++        cueDone = false
++        commandEngine = "not started"
++        commandError = ""
++        handler.removeCallbacks(cueFallback)
+         showStatus("Wake heard. Paused. Say the song name after the beep.")
+         val myGen = gen
+         val starter =
+@@ -487,6 +502,8 @@ class VoiceListenService : Service() {
+                     it.startListening(SessionListener(gen))
+                 }
+             handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
++            commandEngine = "Vosk fallback ($engineNote)"
++            playCueOnce("Vosk listening started")
+             Logger.w(TAG, "command stage listening")
+         } catch (e: Exception) {
+             Logger.e(TAG, "command recognizer failed: ${e.message}")
+@@ -502,6 +519,22 @@ class VoiceListenService : Service() {
+         val text = VoiceQueryGate.clean(rawText)
+         val query = VoiceQueryGate.clean(VoiceCommandParser.commandFrom(text))
+         Logger.w(TAG, "command heard: '$rawText' -> query '$query'")
++        val partial = lastCommandPartial
++        val outcome =
++            when {
++                text.isBlank() -> "nothing heard"
++                VoiceQueryGate.isCancel(query) -> "cancel word"
++                !VoiceQueryGate.usable(query) -> "not a usable song name"
++                else -> "sent to search"
++            }
++        showLastCommand(
++            "Last command at ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}\n" +
++                "Engine: $commandEngine\n" +
++                "Raw heard: \"$rawText\"\n" +
++                "Last partial: \"$partial\"\n" +
++                "Query after parsing: \"$query\"\n" +
++                "Outcome: $outcome" + (if (commandError.isNotEmpty()) "\nRecognizer: $commandError" else ""),
++        )
+         when {
+             text.isBlank() -> {
+                 showStatus("Heard nothing after the beep. Nothing played. Music stays paused.")
+@@ -602,11 +635,20 @@ class VoiceListenService : Service() {
+         )
+     }
+ 
++    /** Plays the listening cue once per command, when the recognizer is ready (gain 70 as before, no system volume change). */
++    private fun playCueOnce(reason: String) {
++        if (cueDone || stopping || stage != Stage.COMMAND) return
++        cueDone = true
++        handler.removeCallbacks(cueFallback)
++        Logger.w(TAG, "listening cue ($reason)")
++        signalListening()
++    }
++
+     private fun signalListening() {
+         try {
+             ToneGenerator(AudioManager.STREAM_MUSIC, 70).apply {
+-                startTone(ToneGenerator.TONE_PROP_ACK, 200)
+-                handler.postDelayed({ release() }, 400)
++                startTone(ToneGenerator.TONE_PROP_PROMPT, 400)
++                handler.postDelayed({ release() }, 700)
+             }
+         } catch (e: Exception) {
+             Logger.w(TAG, "beep failed: ${e.message}")
+@@ -694,6 +736,28 @@ class VoiceListenService : Service() {
+             }
+         }
+ 
++    private fun showLastCommand(text: String) {
++        Logger.w(TAG, "last command: $text")
++        handler.post {
++            if (stopping) return@post
++            try {
++                val n =
++                    NotificationCompat
++                        .Builder(this, CHANNEL_ID)
++                        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
++                        .setContentTitle("Last command")
++                        .setContentText(text.lineSequence().drop(1).firstOrNull() ?: text)
++                        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
++                        .setOnlyAlertOnce(true)
++                        .setAutoCancel(false)
++                        .build()
++                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID + 3, n)
++            } catch (e: Exception) {
++                Logger.w(TAG, "last command notify failed: ${e.message}")
++            }
++        }
++    }
++
+     private fun showLastWakeCheck(text: String) {
+         Logger.w(TAG, "last wake check: $text")
+         handler.post {
+@@ -774,6 +838,7 @@ class VoiceListenService : Service() {
+         // one last onFinalResult after this returns, which must never be read as the next stage's text.
+         gen += 1
+         handler.removeCallbacks(commandTimeout)
++        handler.removeCallbacks(cueFallback)
+         commandStart?.let { handler.removeCallbacks(it) }
+         commandStart = null
+         try {
