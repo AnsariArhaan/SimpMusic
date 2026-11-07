@@ -1,0 +1,437 @@
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+index db9929f..3677d05 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+@@ -551,10 +551,20 @@ internal class SimpleMediaSessionCallback(
+      */
+     private suspend fun handleVoiceQuery(voiceQuery: String) {
+         try {
+-            val wanted = VoiceTitleMatcher.wantedFrom(voiceQuery)
++            val spoken = VoiceTitleMatcher.parse(voiceQuery)
++            val wanted = spoken.full
+             val likedSongs = songRepository.getLikedSongs().first()
+             val titles = likedSongs.map { it.title }
+-            when (val liked = VoiceTitleMatcher.matchLiked(wanted, titles)) {
++            val likedCands =
++                likedSongs.map {
++                    VoiceTitleMatcher.Cand(
++                        title = it.title,
++                        artists = it.artistName ?: emptyList(),
++                        album = it.albumName,
++                        videoId = it.videoId,
++                    )
++                }
++            when (val liked = VoiceTitleMatcher.matchLikedQualified(spoken, likedCands)) {
+                 is VoiceTitleMatcher.Liked.Play -> {
+                     val matched = likedSongs[liked.index].toTrack()
+                     mediaPlayerHandler.setQueueData(
+@@ -598,30 +608,25 @@ internal class SimpleMediaSessionCallback(
+                     VoiceDiagnostics.report("Not played: online search failed (no network?).", VoiceOutcome.NOT_PLAYED)
+                     return
+                 }
+-            val top = results.filter { it.isAvailable }.take(5)
++            val top = results.filter { it.isAvailable }.take(10)
+             fun artistsOf(t: Track): List<String> = t.artists?.mapNotNull { a -> a.name } ?: emptyList()
+-            val exact = top.filter { VoiceTitleMatcher.isExact(wanted, it.title) }
+-            val candidates = exact.ifEmpty { top.filter { VoiceTitleMatcher.acceptOnline(wanted, it.title, artistsOf(it)) } }
+-            // No artist spoken (every heard word is in the title) and several different primary artists
+-            // qualify: do not guess which one is meant.
+-            val artistSpoken = candidates.any { c -> VoiceTitleMatcher.heardArtist(wanted, c.title) }
+-            val distinctArtists = candidates.map { c -> artistsOf(c).firstOrNull()?.let { VoiceTitleMatcher.normalize(it) } ?: "" }.distinct()
+-            val pick = if (candidates.isNotEmpty() && (artistSpoken || distinctArtists.size == 1)) candidates.first() else null
+-            if (pick == null) {
+-                val shown =
+-                    (if (candidates.isNotEmpty()) candidates else top).take(3)
+-                        .joinToString(", ") { "\"${it.title}\" - ${artistsOf(it).firstOrNull() ?: "?"}" }
+-                VoiceDiagnostics.report(
+-                    if (candidates.isNotEmpty()) {
+-                        "Not played: several artists have \"$wanted\". Say the artist too: $shown."
+-                    } else {
+-                        "Not played: no confident match online for \"$wanted\"." +
+-                            if (shown.isNotEmpty()) " Top results: $shown." else ""
+-                    },
+-                    VoiceOutcome.NOT_PLAYED,
+-                )
+-                return
+-            }
++            val onlineCands =
++                top.map {
++                    VoiceTitleMatcher.Cand(title = it.title, artists = artistsOf(it), album = it.album?.name, videoId = it.videoId)
++                }
++            val pick =
++                when (val d = VoiceTitleMatcher.decideOnline(spoken, onlineCands)) {
++                    is VoiceTitleMatcher.Online.Play -> top.first { it.videoId == d.videoId }
++                    is VoiceTitleMatcher.Online.Refuse -> {
++                        val shown =
++                            top.take(3).joinToString(", ") { "\"${it.title}\" - ${artistsOf(it).firstOrNull() ?: "?"}" }
++                        VoiceDiagnostics.report(
++                            "Not played: ${d.reason}." + if (shown.isNotEmpty()) " Top results: $shown." else "",
++                            VoiceOutcome.NOT_PLAYED,
++                        )
++                        return
++                    }
++                }
+             mediaPlayerHandler.setQueueData(
+                 QueueData.Data(
+                     listTracks = arrayListOf(pick),
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+index b8bed9b..8ee769a 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+@@ -112,4 +112,118 @@ internal object VoiceTitleMatcher {
+         val titleSet = normalize(title).split(' ').toSet()
+         return wanted.split(' ').filter { it.isNotEmpty() && it !in allowedExtra }.any { it !in titleSet }
+     }
++
++    // ---- Movie / album / artist qualifier and same-title ambiguity (online + liked) ----
++
++    /** What was said, split into the title words and an optional "from <movie/album>" part. */
++    data class Spoken(
++        val full: String,
++        val title: String,
++        val qualifier: List<String>,
++    )
++
++    private val fromSplit = Regex("\\s+(?:from|of|by|movie|film|album)\\s+")
++    private val numberWords = mapOf("one" to "1", "two" to "2", "three" to "3", "four" to "4", "five" to "5", "zero" to "0")
++
++    private val qualifierFiller = setOf("the", "a", "an", "movie", "film", "album", "song", "ost", "by", "from")
++
++    private fun canon(word: String): String = numberWords[word] ?: word
++
++    fun words(text: String): List<String> =
++        normalize(text).split(' ').filter { it.isNotEmpty() }.map { canon(it) }
++
++    /** Words in brackets, e.g. the movie in `Chammak Challo (From "Ra.One")`. */
++    private fun bracketWords(title: String): List<String> =
++        bracketed.findAll(title).flatMap { words(it.value.trim('(', ')', '[', ']')).asSequence() }.toList()
++
++    fun parse(query: String): Spoken {
++        val full = wantedFrom(query)
++        val parts = fromSplit.split(" $full ".trim(), limit = 2)
++        val title = parts[0].trim()
++        val qual = if (parts.size == 2) words(parts[1]).filter { it !in qualifierFiller } else emptyList()
++        return Spoken(full = full, title = title, qualifier = qual)
++    }
++
++    data class Cand(
++        val title: String,
++        val artists: List<String>,
++        val album: String?,
++        val videoId: String,
++    )
++
++    /** Every qualifier word appears in the album, a bracket of the title, or an artist name. */
++    fun qualifierSatisfied(
++        qualifier: List<String>,
++        c: Cand,
++    ): Boolean {
++        if (qualifier.isEmpty()) return true
++        val pool = (words(c.album ?: "") + bracketWords(c.title) + c.artists.flatMap { words(it) }).toSet()
++        return qualifier.all { it in pool }
++    }
++
++    private fun titleHit(
++        spoken: Spoken,
++        c: Cand,
++    ): Boolean =
++        normalize(c.title).let { n -> n == spoken.full || (spoken.qualifier.isNotEmpty() && n == spoken.title) } &&
++            !isUnaskedVariant(spoken.full, c.title)
++
++    sealed interface Online {
++        data class Play(
++            val videoId: String,
++        ) : Online
++
++        data class Refuse(
++            val reason: String,
++        ) : Online
++    }
++
++    /**
++     * Decision for an online search result list. Fail closed:
++     *  - a spoken movie/album must be found in the track's album, title brackets or artists;
++     *  - with only a title spoken, it plays only when exactly one same-title track exists in the
++     *    results (several versions of one title are never guessed between);
++     *  - an artist spoken (words beyond the title) falls back to [acceptOnline].
++     */
++    fun decideOnline(
++        spoken: Spoken,
++        results: List<Cand>,
++    ): Online {
++        if (spoken.title.length < 4) return Online.Refuse("too short")
++        val hits = results.filter { titleHit(spoken, it) }.distinctBy { it.videoId }
++        if (spoken.qualifier.isNotEmpty()) {
++            val ok = hits.filter { qualifierSatisfied(spoken.qualifier, it) }
++            if (ok.isEmpty()) {
++                val seen = hits.take(3).joinToString(", ") { "\"${it.title}\" (${it.album ?: it.artists.firstOrNull() ?: "?"})" }
++                return Online.Refuse("no \"${spoken.title}\" matched \"${spoken.qualifier.joinToString(" ")}\"" + if (seen.isNotEmpty()) ". Found: $seen" else "")
++            }
++            val artistSets = ok.map { it.artists.firstOrNull()?.let { a -> normalize(a) } ?: "" }.distinct()
++            if (artistSets.size > 1) return Online.Refuse("several \"${spoken.title}\" match that movie/album; say the artist too")
++            return Online.Play(ok.first().videoId)
++        }
++        if (hits.size == 1 && results.firstOrNull()?.videoId == hits.first().videoId) return Online.Play(hits.first().videoId)
++        if (hits.size > 1) {
++            val seen = hits.take(3).joinToString(", ") { "${it.artists.firstOrNull() ?: "?"}${it.album?.let { a -> " ($a)" } ?: ""}" }
++            return Online.Refuse("several versions of \"${spoken.title}\": $seen. Say the movie or artist too")
++        }
++        // No same-title hit: only an artist-qualified request ("title by artist") may still match.
++        val byArtist = results.filter { acceptOnline(spoken.full, it.title, it.artists) && heardArtist(spoken.full, it.title) }
++        val primary = byArtist.map { it.artists.firstOrNull()?.let { a -> normalize(a) } ?: "" }.distinct()
++        if (byArtist.isNotEmpty() && primary.size == 1) return Online.Play(byArtist.first().videoId)
++        return Online.Refuse("no confident match for \"${spoken.full}\"")
++    }
++
++    /** Liked-songs variant: with a spoken qualifier the album/bracket/artist must agree too. */
++    fun matchLikedQualified(
++        spoken: Spoken,
++        liked: List<Cand>,
++    ): Liked {
++        if (spoken.qualifier.isEmpty()) return matchLiked(spoken.full, liked.map { it.title })
++        val idx = liked.indices.filter { titleHit(spoken, liked[it]) && qualifierSatisfied(spoken.qualifier, liked[it]) }
++        return when (idx.size) {
++            0 -> Liked.None
++            1 -> Liked.Play(idx[0])
++            else -> Liked.Ambiguous(idx.take(5))
++        }
++    }
+ }
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index 1fc027c..d72fe21 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -382,6 +382,8 @@ class VoiceListenService : Service() {
+         lastCommandPartial = ""
+         val grammar = "[\"${VoiceCommandParser.WAKE_PHRASE}\", \"[unk]\"]"
+         val rec = Recognizer(m, 16000.0f, grammar)
++        // Word timings + confidences are what VoiceWakeGate checks on the FINAL wake result.
++        rec.setWords(true)
+         recognizer = rec
+         speechService =
+             SpeechService(rec, 16000.0f).also {
+@@ -565,16 +567,43 @@ class VoiceListenService : Service() {
+     private fun onPartialResult(hypothesis: String?) {
+         val text = extractText(hypothesis, "partial")
+         when (stage) {
+-            Stage.WAKE ->
+-                if (SystemClock.elapsedRealtime() >= ignoreWakeUntil && VoiceCommandParser.isWakeOnly(text)) {
+-                    enterCommandStage()
+-                }
++            // Wake is decided on the final result only (see onWakeFinal); a partial never opens the mic.
++            Stage.WAKE -> {}
+             Stage.COMMAND -> if (text.isNotEmpty()) lastCommandPartial = text
+             else -> {}
+         }
+     }
+ 
++    private fun onWakeFinal(hypothesis: String?) {
++        if (SystemClock.elapsedRealtime() < ignoreWakeUntil) return
++        val text = extractText(hypothesis, "text")
++        if (text.isEmpty()) return
++        val words =
++            try {
++                val arr = JSONObject(hypothesis ?: "").optJSONArray("result")
++                if (arr == null) {
++                    null
++                } else {
++                    (0 until arr.length()).map { i ->
++                        val o = arr.getJSONObject(i)
++                        VoiceWakeGate.Word(o.optString("word"), o.optDouble("conf", 0.0), o.optDouble("start", 0.0), o.optDouble("end", 0.0))
++                    }
++                }
++            } catch (e: Exception) {
++                null
++            }
++        when (val v = VoiceWakeGate.judge(VoiceCommandParser.WAKE_PHRASE, text, words)) {
++            VoiceWakeGate.Verdict.Accept -> enterCommandStage()
++            is VoiceWakeGate.Verdict.Reject ->
++                if (text.contains(VoiceCommandParser.WAKE_PHRASE)) {
++                    Logger.w(TAG, "wake rejected: ${v.reason}")
++                    showStatus("Ignored a wake-like sound (${v.reason}).")
++                }
++        }
++    }
++
+     private fun onResult(hypothesis: String?) {
++        if (stage == Stage.WAKE) onWakeFinal(hypothesis)
+         if (stage == Stage.COMMAND) {
+             val text = extractText(hypothesis, "text")
+             if (text.isNotEmpty()) finishCommandStage(text)
+@@ -582,6 +611,7 @@ class VoiceListenService : Service() {
+     }
+ 
+     private fun onFinalResult(hypothesis: String?) {
++        if (stage == Stage.WAKE) onWakeFinal(hypothesis)
+         if (stage == Stage.COMMAND) {
+             val text = extractText(hypothesis, "text")
+             finishCommandStage(if (text.isNotEmpty()) text else lastCommandPartial)
+diff --git a/cv/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt
+new file mode 100644
+index 0000000..497dfb0
+--- /dev/null
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt
+@@ -0,0 +1,49 @@
++package com.maxrave.media3.voice
++
++/**
++ * Accepts a wake only from a FINAL recognizer result, never from a streaming partial. A grammar
++ * recognizer force-fits nearby speech to the wake phrase, so the checks here are what stands between
++ * background talk and an open microphone: the text must be exactly the phrase, every word must carry
++ * a confidence at or above [MIN_CONFIDENCE], and the spoken span must have a plausible length.
++ *
++ * The thresholds are starting values chosen without real recordings. They are NOT measured against
++ * the user's voice or against background speech; every rejection is reported with its reason so the
++ * values can be tuned from phone evidence.
++ */
++internal object VoiceWakeGate {
++    const val MIN_CONFIDENCE = 0.80
++    const val MIN_SPAN_SECONDS = 0.30
++    const val MAX_SPAN_SECONDS = 1.60
++
++    data class Word(
++        val word: String,
++        val conf: Double,
++        val start: Double,
++        val end: Double,
++    )
++
++    sealed interface Verdict {
++        object Accept : Verdict
++
++        data class Reject(
++            val reason: String,
++        ) : Verdict
++    }
++
++    fun judge(
++        phrase: String,
++        text: String,
++        words: List<Word>?,
++    ): Verdict {
++        val heard = text.trim().lowercase()
++        if (heard != phrase) return Verdict.Reject("heard \"$heard\"")
++        val expected = phrase.split(' ')
++        if (words == null || words.size != expected.size) return Verdict.Reject("no word timings")
++        if (words.map { it.word.lowercase() } != expected) return Verdict.Reject("words differ")
++        val low = words.minOf { it.conf }
++        if (low < MIN_CONFIDENCE) return Verdict.Reject("low confidence ${"%.2f".format(low)}")
++        val span = words.last().end - words.first().start
++        if (span < MIN_SPAN_SECONDS || span > MAX_SPAN_SECONDS) return Verdict.Reject("span ${"%.2f".format(span)}s")
++        return Verdict.Accept
++    }
++}
+diff --git a/cv/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
+new file mode 100644
+index 0000000..8020c83
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
+@@ -0,0 +1,76 @@
++package com.maxrave.media3.service.callback
++
++import com.maxrave.media3.service.callback.VoiceTitleMatcher.Cand
++import com.maxrave.media3.service.callback.VoiceTitleMatcher.Online
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** Pure-logic regressions for the phone failure "chammak challo ... from Ra.One played a Bihari version". */
++class VoiceOnlineDecisionTest {
++    private val vishal = Cand("Chammak Challo", listOf("Vishal-Shekhar", "Akon", "Hamsika Iyer"), "Ra-One", "VS")
++    private val bihari = Cand("Chammak Challo", listOf("Dhanraj Banchor"), "Chammak Challo", "BH")
++    private val mani = Cand("Chammak Challo", listOf("Mani The Music"), "Chammak Challo", "MM")
++    private val bracketOnly = Cand("Chammak Challo (From \"Ra.One\")", listOf("Someone"), null, "BR")
++
++    private fun decide(q: String, vararg r: Cand) = VoiceTitleMatcher.decideOnline(VoiceTitleMatcher.parse(q), r.toList())
++
++    @Test
++    fun parseSplitsMovieQualifier() {
++        val s = VoiceTitleMatcher.parse("chammak challo from ra one")
++        assertEquals("chammak challo", s.title)
++        assertEquals(listOf("ra", "1"), s.qualifier)
++        assertEquals(listOf("ra", "1"), VoiceTitleMatcher.parse("Chammak Challo from Ra.One").qualifier)
++    }
++
++    @Test
++    fun movieQualifierPicksTheRightVersionNotTheBihariOne() {
++        assertEquals(Online.Play("VS"), decide("chammak challo from ra one", bihari, mani, vishal))
++        assertEquals(Online.Play("BR"), decide("chammak challo from ra one", bihari, bracketOnly))
++    }
++
++    @Test
++    fun movieQualifierWithNoMatchingVersionRefuses() {
++        assertTrue(decide("chammak challo from ra one", bihari, mani) is Online.Refuse)
++    }
++
++    @Test
++    fun titleOnlyWithSeveralSameTitleVersionsRefuses() {
++        assertTrue(decide("chammak challo", vishal, mani, bihari) is Online.Refuse)
++        assertTrue(decide("chammak challo", bihari, vishal) is Online.Refuse)
++    }
++
++    @Test
++    fun titleOnlyPlaysOnlyWhenSingleHitIsFirstResult() {
++        val other = Cand("Another Song", listOf("X"), "Y", "OT")
++        assertEquals(Online.Play("VS"), decide("chammak challo", vishal, other))
++        assertTrue(decide("chammak challo", other, vishal) is Online.Refuse)
++    }
++
++    @Test
++    fun artistSpokenSelectsThatArtist() {
++        assertEquals(Online.Play("VS"), decide("chammak challo by vishal shekhar", vishal, bihari))
++        assertTrue(decide("chammak challo by nobody", vishal, bihari) is Online.Refuse)
++    }
++
++    @Test
++    fun unaskedVariantNeverPlays() {
++        val slowed = Cand("Chammak Challo (Slowed)", listOf("DJ"), "x", "SL")
++        assertTrue(decide("chammak challo", slowed) is Online.Refuse)
++    }
++
++    @Test
++    fun likedQualifiedChecksAlbum() {
++        val liked = listOf(bihari, vishal)
++        val s = VoiceTitleMatcher.parse("chammak challo from ra one")
++        assertEquals(VoiceTitleMatcher.Liked.Play(1), VoiceTitleMatcher.matchLikedQualified(s, liked))
++        assertEquals(
++            VoiceTitleMatcher.Liked.None,
++            VoiceTitleMatcher.matchLikedQualified(s, listOf(bihari)),
++        )
++        // no qualifier: unchanged behaviour (two same titles = ambiguous)
++        assertTrue(
++            VoiceTitleMatcher.matchLikedQualified(VoiceTitleMatcher.parse("chammak challo"), liked) is VoiceTitleMatcher.Liked.Ambiguous,
++        )
++    }
++}
+diff --git a/cv/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt
+new file mode 100644
+index 0000000..8db8900
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt
+@@ -0,0 +1,26 @@
++package com.maxrave.media3.voice
++
++import com.maxrave.media3.voice.VoiceWakeGate.Verdict
++import com.maxrave.media3.voice.VoiceWakeGate.Word
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class VoiceWakeGateTest {
++    private val good = listOf(Word("hey", 1.0, 0.10, 0.35), Word("ben", 0.95, 0.35, 0.70))
++
++    @Test
++    fun acceptsExactPhraseWithGoodConfidenceAndSpan() {
++        assertEquals(Verdict.Accept, VoiceWakeGate.judge("hey ben", "hey ben", good))
++    }
++
++    @Test
++    fun rejectsNoiseWordsLowConfidenceBadSpanAndMissingTimings() {
++        assertTrue(VoiceWakeGate.judge("hey ben", "hey [unk]", good) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", null) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", listOf(Word("hey", 1.0, 0.1, 0.3), Word("ben", 0.5, 0.3, 0.7))) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", listOf(Word("hey", 1.0, 0.1, 0.15), Word("ben", 1.0, 0.15, 0.20))) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey ben", "hey ben", listOf(Word("hey", 1.0, 0.0, 1.0), Word("ben", 1.0, 1.0, 2.5))) is Verdict.Reject)
++        assertTrue(VoiceWakeGate.judge("hey ben", "so hey ben", good) is Verdict.Reject)
++    }
++}
