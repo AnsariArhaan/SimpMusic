@@ -1,0 +1,406 @@
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/parser/search/VideoResultParser.kt b/data/src/commonMain/kotlin/com/maxrave/data/parser/search/VideoResultParser.kt
+index 0a8206e..9b9b0ce 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/parser/search/VideoResultParser.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/parser/search/VideoResultParser.kt
+@@ -28,7 +28,7 @@ internal fun parseSearchVideo(result: SearchResult): ArrayList<VideosResult> {
+                 title = song.title,
+                 videoId = song.id,
+                 videoType = song.musicVideoType,
+-                views = null,
++                views = song.views,
+                 year = "",
+             ),
+         )
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+index 3677d05..60d471d 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+@@ -614,8 +614,48 @@ internal class SimpleMediaSessionCallback(
+                 top.map {
+                     VoiceTitleMatcher.Cand(title = it.title, artists = artistsOf(it), album = it.album?.name, videoId = it.videoId)
+                 }
++            // Popularity signals for the tie-break: public views from a videos search (view counts
++            // never make a non-matching song playable), then the user's own local history. A failed
++            // videos search or missing counts degrade to the personal signal, then to refusal.
++            val viewRows: List<VoiceTitleMatcher.ViewRow> =
++                searchRepository.getSearchDataVideo(wanted).lastOrNull()?.let { resource ->
++                    when (resource) {
++                        is Resource.Success ->
++                            resource.data?.map {
++                                VoiceTitleMatcher.ViewRow(
++                                    title = it.title,
++                                    artists = it.artists?.mapNotNull { a -> a.name } ?: emptyList(),
++                                    views = VoiceTitleMatcher.parseViews(it.views),
++                                )
++                            } ?: emptyList()
++                        else -> emptyList()
++                    }
++                } ?: emptyList()
++            val candIds = onlineCands.map { it.videoId }
++            val localStats =
++                runCatching { songRepository.getSongsByListVideoId(candIds).first() }
++                    .getOrDefault(emptyList())
++                    .associateBy { it.videoId }
++            val playlistIds =
++                runCatching {
++                    localPlaylistRepository
++                        .getAllLocalPlaylists()
++                        .first()
++                        .flatMap { p -> runCatching { localPlaylistRepository.getListTrackVideoId(p.id) }.getOrDefault(emptyList()) }
++                        .toSet()
++                }.getOrDefault(emptySet())
++            val pop =
++                onlineCands.associate { cand ->
++                    val e = localStats[cand.videoId]
++                    cand.videoId to
++                        VoiceTitleMatcher.Pop(
++                            views = VoiceTitleMatcher.viewsFor(cand, viewRows),
++                            saved = e?.liked == true || playlistIds.contains(cand.videoId),
++                            plays = e?.totalPlayTime ?: 0,
++                        )
++                }
+             val pick =
+-                when (val d = VoiceTitleMatcher.decideOnline(spoken, onlineCands)) {
++                when (val d = VoiceTitleMatcher.decideOnline(spoken, onlineCands, pop)) {
+                     is VoiceTitleMatcher.Online.Play -> top.first { it.videoId == d.videoId }
+                     is VoiceTitleMatcher.Online.Refuse -> {
+                         val shown =
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+index 8ee769a..d7c1d7c 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+@@ -51,6 +51,7 @@ internal object VoiceTitleMatcher {
+             }
+         verdict(pool.filter { fullNormalize(titles[it]) == wanted })?.let { return it }
+         verdict(pool.filter { normalize(titles[it]) == wanted })?.let { return it }
++        verdict(pool.filter { titleEquiv(normalize(titles[it]), wanted) })?.let { return it }
+         // Very short text is too easy to produce from noise: only a whole-title match may play.
+         if (wanted.length < 4) return Liked.None
+         val padded = " $wanted "
+@@ -98,8 +99,8 @@ internal object VoiceTitleMatcher {
+         val titleSet = titleWords.toSet()
+         val artistWords = artists.flatMap { normalize(it).split(' ') }.filter { it.isNotEmpty() }.toSet()
+         val explained = titleSet + artistWords + allowedExtra
+-        if (!heard.all { it in explained }) return false
+-        val inTitle = heard.count { it in titleSet }
++        if (!heard.all { wordIn(it, explained) }) return false
++        val inTitle = heard.count { wordIn(it, titleSet) }
+         if (inTitle == 0) return false
+         return inTitle.toDouble() / titleWords.size >= 0.5
+     }
+@@ -165,7 +166,7 @@ internal object VoiceTitleMatcher {
+         spoken: Spoken,
+         c: Cand,
+     ): Boolean =
+-        normalize(c.title).let { n -> n == spoken.full || (spoken.qualifier.isNotEmpty() && n == spoken.title) } &&
++        normalize(c.title).let { n -> titleEquiv(n, spoken.full) || (spoken.qualifier.isNotEmpty() && titleEquiv(n, spoken.title)) } &&
+             !isUnaskedVariant(spoken.full, c.title)
+ 
+     sealed interface Online {
+@@ -188,6 +189,7 @@ internal object VoiceTitleMatcher {
+     fun decideOnline(
+         spoken: Spoken,
+         results: List<Cand>,
++        pop: Map<String, Pop> = emptyMap(),
+     ): Online {
+         if (spoken.title.length < 4) return Online.Refuse("too short")
+         val hits = results.filter { titleHit(spoken, it) }.distinctBy { it.videoId }
+@@ -203,6 +205,7 @@ internal object VoiceTitleMatcher {
+         }
+         if (hits.size == 1 && results.firstOrNull()?.videoId == hits.first().videoId) return Online.Play(hits.first().videoId)
+         if (hits.size > 1) {
++            popularityPick(hits, pop)?.let { return Online.Play(it.videoId) }
+             val seen = hits.take(3).joinToString(", ") { "${it.artists.firstOrNull() ?: "?"}${it.album?.let { a -> " ($a)" } ?: ""}" }
+             return Online.Refuse("several versions of \"${spoken.title}\": $seen. Say the movie or artist too")
+         }
+@@ -213,6 +216,142 @@ internal object VoiceTitleMatcher {
+         return Online.Refuse("no confident match for \"${spoken.full}\"")
+     }
+ 
++    // ---- Romanised spelling tolerance and popularity tie-break (approved voice15 scope) ----
++
++    private const val FUZZY_MIN_LEN = 8
++    private const val FUZZY_MAX_DIST = 2
++    private const val WORD_FUZZY_MIN_LEN = 5
++
++    /** Banded Levenshtein: true only when the edit distance is at most [max]. */
++    internal fun levenshteinLeq(
++        a: String,
++        b: String,
++        max: Int,
++    ): Boolean {
++        if (kotlin.math.abs(a.length - b.length) > max) return false
++        var prev = IntArray(b.length + 1) { it }
++        for (i in 1..a.length) {
++            val cur = IntArray(b.length + 1)
++            cur[0] = i
++            var rowMin = Int.MAX_VALUE
++            for (j in 1..b.length) {
++                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
++                cur[j] = minOf(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
++                if (cur[j] < rowMin) rowMin = cur[j]
++            }
++            if (rowMin > max) return false
++            prev = cur
++        }
++        return prev[b.length] <= max
++    }
++
++    /**
++     * Romanised spelling tolerance for titles ("chhammak chhallo" = "chammak challo"): at most two
++     * edits, same first letter, and only when both sides have 8+ normalised characters. Shorter
++     * titles stay exact so unrelated short titles can never fuzzy-match.
++     */
++    fun titleEquiv(
++        a: String,
++        b: String,
++    ): Boolean {
++        if (a == b) return true
++        if (a.isEmpty() || b.isEmpty()) return false
++        if (minOf(a.length, b.length) < FUZZY_MIN_LEN) return false
++        if (a.first() != b.first()) return false
++        return levenshteinLeq(a, b, FUZZY_MAX_DIST)
++    }
++
++    /**
++     * A heard word explained by a word set: exact, or one edit away when both words are 5+ chars and
++     * start with the same letter (transliteration tolerance, not a general near-word match).
++     */
++    private fun wordIn(
++        w: String,
++        s: Set<String>,
++    ): Boolean =
++        w in s ||
++            (
++                w.length >= WORD_FUZZY_MIN_LEN &&
++                    s.any { it.length >= WORD_FUZZY_MIN_LEN && it.first() == w.first() && levenshteinLeq(w, it, 1) }
++            )
++
++    /** Per-candidate popularity for the tie-break. Null views = unknown, not zero. */
++    data class Pop(
++        val views: Long?,
++        val saved: Boolean,
++        val plays: Long,
++    )
++
++    /** One videos-shelf row, used only as a public view-count source; never playable itself. */
++    data class ViewRow(
++        val title: String,
++        val artists: List<String>,
++        val views: Long?,
++    )
++
++    private val viewsText = Regex("(?i)^\s*([\d.,]+)\s*([KMB]?)\s+views?\s*$")
++
++    /** "760M views" -> 760000000; "No views", unparseable or missing -> null. */
++    fun parseViews(text: String?): Long? {
++        if (text == null) return null
++        val m = viewsText.find(text) ?: return null
++        val num = m.groupValues[1].replace(",", "").toDoubleOrNull() ?: return null
++        val mult =
++            when (m.groupValues[2].uppercase()) {
++                "K" -> 1_000L
++                "M" -> 1_000_000L
++                "B" -> 1_000_000_000L
++                else -> 1L
++            }
++        return (num * mult).toLong()
++    }
++
++    /**
++     * Public views for a song candidate: the videos-shelf row must carry the same normalised title
++     * and share at least one artist word, so a same-title video by someone else never donates views.
++     */
++    fun viewsFor(
++        c: Cand,
++        rows: List<ViewRow>,
++    ): Long? {
++        val myTitle = normalize(c.title)
++        val myArtists = c.artists.flatMap { words(it) }.toSet()
++        return rows
++            .filter { r ->
++                normalize(r.title) == myTitle &&
++                    r.artists.flatMap { words(it) }.any { it in myArtists }
++            }.mapNotNull { it.views }
++            .maxOrNull()
++    }
++
++    /**
++     * Tie-break between several matching versions of the requested title; popularity never makes a
++     * non-matching song playable. Public views first: a unique highest known count wins. Equal or
++     * unknown views fall back to the user's own data: a unique saved (liked/playlisted) track wins,
++     * otherwise a unique highest local play count wins. Still tied -> null and the caller refuses.
++     */
++    private fun popularityPick(
++        hits: List<Cand>,
++        pop: Map<String, Pop>,
++    ): Cand? {
++        val withViews = hits.mapNotNull { h -> pop[h.videoId]?.views?.let { h to it } }
++        if (withViews.isNotEmpty()) {
++            val maxViews = withViews.maxOf { it.second }
++            val winners = withViews.filter { it.second == maxViews }
++            if (winners.size == 1) return winners[0].first
++        }
++        val saved = hits.filter { pop[it.videoId]?.saved == true }
++        if (saved.size == 1) return saved[0]
++        val pool = if (saved.size > 1) saved else hits
++        val withPlays = pool.mapNotNull { h -> pop[h.videoId]?.plays?.takeIf { it > 0 }?.let { h to it } }
++        if (withPlays.isNotEmpty()) {
++            val maxPlays = withPlays.maxOf { it.second }
++            val winners = withPlays.filter { it.second == maxPlays }
++            if (winners.size == 1) return winners[0].first
++        }
++        return null
++    }
++
+     /** Liked-songs variant: with a spoken qualifier the album/bracket/artist must agree too. */
+     fun matchLikedQualified(
+         spoken: Spoken,
+diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
+index 8020c83..5efeb60 100644
+--- a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
++++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceOnlineDecisionTest.kt
+@@ -73,4 +73,109 @@ class VoiceOnlineDecisionTest {
+             VoiceTitleMatcher.matchLikedQualified(VoiceTitleMatcher.parse("chammak challo"), liked) is VoiceTitleMatcher.Liked.Ambiguous,
+         )
+     }
++
++    // ---- voice15: romanised spelling tolerance + popularity tie-break ----
++
++    private val keshaw = Cand("Chammak Chhallo", listOf("Keshaw Sahu"), "Chhammak Chhallo", "KS")
++
++    private fun decidePop(
++        q: String,
++        pop: Map<String, VoiceTitleMatcher.Pop>,
++        vararg r: Cand,
++    ) = VoiceTitleMatcher.decideOnline(VoiceTitleMatcher.parse(q), r.toList(), pop)
++
++    private fun popOf(
++        views: Long?,
++        saved: Boolean,
++        plays: Long,
++    ) = VoiceTitleMatcher.Pop(views, saved, plays)
++
++    @Test
++    fun transliterationPlaysSingleFuzzyHit() {
++        // The phone failure: heard "chhammak chhallo", only "Chammak Challo" exists.
++        assertEquals(Online.Play("VS"), decide("chhammak chhallo", vishal))
++        assertEquals(Online.Play("VS"), decide("chammak challo", vishal))
++    }
++
++    @Test
++    fun transliterationPicksHighestPublicViews() {
++        val pop = mapOf("VS" to popOf(760_000_000L, false, 0), "KS" to popOf(null, false, 0))
++        assertEquals(Online.Play("VS"), decidePop("chhammak chhallo", pop, keshaw, vishal))
++    }
++
++    @Test
++    fun equalViewsFallBackToSaved() {
++        val pop = mapOf("VS" to popOf(760_000_000L, false, 0), "KS" to popOf(760_000_000L, true, 0))
++        assertEquals(Online.Play("KS"), decidePop("chhammak chhallo", pop, vishal, keshaw))
++    }
++
++    @Test
++    fun unknownViewsFallBackToLocalPlays() {
++        val pop = mapOf("VS" to popOf(null, false, 0), "KS" to popOf(null, false, 3))
++        assertEquals(Online.Play("KS"), decidePop("chhammak chhallo", pop, vishal, keshaw))
++    }
++
++    @Test
++    fun unresolvedTieStillRefuses() {
++        val pop = mapOf("VS" to popOf(null, false, 2), "KS" to popOf(null, false, 2))
++        assertTrue(decidePop("chhammak chhallo", pop, vishal, keshaw) is Online.Refuse)
++        assertTrue(decidePop("chhammak chhallo", emptyMap(), vishal, keshaw) is Online.Refuse)
++    }
++
++    @Test
++    fun popularityNeverPromotesNonMatchingSong() {
++        // A hugely popular unrelated title is not even a hit, so views cannot rescue it.
++        val other = Cand("Some Other Song", listOf("Famous Artist"), "Big", "OS")
++        val pop = mapOf("OS" to popOf(9_000_000_000L, true, 99))
++        assertTrue(decidePop("chhammak chhallo", pop, other, vishal, keshaw) !is Online.Play ||
++            (decidePop("chhammak chhallo", pop, other, vishal, keshaw) as Online.Play).videoId != "OS")
++    }
++
++    @Test
++    fun shortTitleStaysExact() {
++        // 7-char titles: "royalty" vs "loyalty" are one edit apart and must NOT match.
++        val loyalty = Cand("Loyalty", listOf("X"), "Y", "LY")
++        assertTrue(decide("royalty", loyalty) is Online.Refuse)
++        assertEquals(Online.Play("LY"), decide("loyalty", loyalty))
++    }
++
++    @Test
++    fun fuzzyStillRefusesUnaskedVariant() {
++        val slowed = Cand("Chammak Challo (Slowed)", listOf("DJ"), "x", "SL")
++        assertTrue(decide("chhammak chhallo", slowed) is Online.Refuse)
++    }
++
++    @Test
++    fun fuzzyMovieQualifierStillPicksRightVersion() {
++        assertEquals(Online.Play("VS"), decide("chhammak chhallo from ra one", bihari, mani, vishal))
++    }
++
++    @Test
++    fun fuzzyArtistQualifiedPlays() {
++        assertEquals(Online.Play("VS"), decide("chhammak chhallo by vishal shekhar", vishal, keshaw))
++    }
++
++    @Test
++    fun parseViewsText() {
++        assertEquals(760_000_000L, VoiceTitleMatcher.parseViews("760M views"))
++        assertEquals(1_200_000_000L, VoiceTitleMatcher.parseViews("1.2B views"))
++        assertEquals(54_000L, VoiceTitleMatcher.parseViews("54K views"))
++        assertEquals(1L, VoiceTitleMatcher.parseViews("1 view"))
++        assertEquals(23_456L, VoiceTitleMatcher.parseViews("23,456 views"))
++        assertEquals(null, VoiceTitleMatcher.parseViews("No views"))
++        assertEquals(null, VoiceTitleMatcher.parseViews(null))
++        assertEquals(null, VoiceTitleMatcher.parseViews("4:06"))
++    }
++
++    @Test
++    fun viewsForRequiresSameTitleAndArtistOverlap() {
++        val rows =
++            listOf(
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Akon", "Vishal-Shekhar", "Hamsika Iyer"), 760_000_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Challo", listOf("Some DJ"), 999_000_000L),
++                VoiceTitleMatcher.ViewRow("Chammak Chhallo", listOf("Keshaw Sahu"), 12_000L),
++            )
++        assertEquals(760_000_000L, VoiceTitleMatcher.viewsFor(vishal, rows))
++        assertEquals(12_000L, VoiceTitleMatcher.viewsFor(keshaw, rows))
++    }
+ }
+diff --git a/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt b/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt
+index ae7baa6..0b012a0 100644
+--- a/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt
++++ b/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/models/YTItem.kt
+@@ -46,6 +46,8 @@ data class SongItem(
+     val counterpart: SongItem? = null,
+     /** A broadcast on air right now, from the row's LIVE chip. False also means "the row did not say". */
+     val isLive: Boolean = false,
++    /** Localized view-count text ("760M views") when the row carried one (videos shelf); null otherwise. */
++    val views: String? = null,
+ ) : YTItem() {
+     override val shareLink: String
+         get() = "https://simpmusic.org/app/watch?v=$id"
+diff --git a/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/pages/SearchPage.kt b/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/pages/SearchPage.kt
+index beabcbc..57e299d 100644
+--- a/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/pages/SearchPage.kt
++++ b/service/kotlinYtmusicScraper/src/commonMain/kotlin/com/maxrave/kotlinytmusicscraper/pages/SearchPage.kt
+@@ -20,6 +20,8 @@ data class SearchResult(
+ )
+ 
+ object SearchPage {
++    private val viewsRun = Regex("(?i)^\\s*[\\d.,]+\\s*[KMB]?\\s+views?\\s*$")
++
+     fun toPodcast(renderer: MusicResponsiveListItemRenderer?): PodcastItem? {
+         return if (renderer == null) {
+             null
+@@ -121,6 +123,7 @@ object SearchPage {
+                         thumbnails = renderer.thumbnail.musicThumbnailRenderer.thumbnail,
+                         musicVideoType = renderer.musicVideoType,
+                         isLive = renderer.isLive,
++                        views = secondaryLine.flatten().firstOrNull { viewsRun.matches(it.text) }?.text?.trim(),
+                     )
+                 }
+ 
