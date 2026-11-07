@@ -1,0 +1,349 @@
+diff --git a/media/media3/src/main/assets/voice-oss-notices.txt b/media/media3/src/main/assets/voice-oss-notices.txt
+index 4d482bf..cfb40d9 100644
+--- a/media/media3/src/main/assets/voice-oss-notices.txt
++++ b/media/media3/src/main/assets/voice-oss-notices.txt
+@@ -1,5 +1,7 @@
+ OPEN-SOURCE NOTICES - "Hey Zora" offline voice listener (SimpMusic fork addition)
+ 
++Voice-control modifications by Arhaan Ansari.
++
+ This application includes the following third-party components for the offline
+ voice listener feature. Items 1-4 are licensed under the Apache License, Version 2.0
+ (see the note on item 4); item 5 is MIT. The Apache text follows at the end of this file.
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index f8d7b54..8585883 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -62,7 +62,6 @@ class VoiceListenService : Service() {
+         private const val COMMAND_START_DELAY_MS = 350L
+         private const val OUTCOME_TIMEOUT_MS = 20000L
+         private const val WAKE_COOLDOWN_MS = 1500L
+-        private const val HEALTH_TICK_MS = 30000L
+         private const val END_SILENCE_S = 1.2f
+         private const val MAX_UTTERANCE_S = 15.0f
+         private const val COMMAND_LANG = "en-IN"
+@@ -110,9 +109,6 @@ class VoiceListenService : Service() {
+     private var androidRecognizer: android.speech.SpeechRecognizer? = null
+     private var engineNote = "Vosk"
+ 
+-    /** Which command engine was started for the current command, shown in "Last command". */
+-    private var commandEngine = "not started"
+-    private var commandError = ""
+     private var cueDone = false
+ 
+     @SuppressLint("NewApi")
+@@ -185,8 +181,7 @@ class VoiceListenService : Service() {
+                     override fun onError(error: Int) {
+                         if (!live()) return
+                         Logger.w(TAG, "on-device recognizer error $error")
+-                        commandError = "on-device error code $error"
+-                        finishCommandStage("")
++                                finishCommandStage("")
+                     }
+ 
+                     override fun onPartialResults(partialResults: Bundle?) {
+@@ -210,8 +205,6 @@ class VoiceListenService : Service() {
+             androidRecognizer = r
+             r.startListening(commandIntent().putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true))
+             handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
+-            commandEngine = "on-device Android ($COMMAND_LANG), web-search language model requested"
+-            showStatus("Listening ($engineNote). Say the song name.")
+             true
+         } catch (e: Throwable) {
+             Logger.w(TAG, "on-device start failed: ${e.message}")
+@@ -221,10 +214,7 @@ class VoiceListenService : Service() {
+ 
+     private val outcomeTimeout =
+         Runnable {
+-            if (awaitingOutcome) {
+-                awaitingOutcome = false
+-                showStatus("No result in time. Nothing played. Music stays paused.")
+-            }
++            awaitingOutcome = false
+         }
+ 
+     /** Forwards a recognizer's callbacks only while it is still the current session (see [gen]). */
+@@ -317,25 +307,6 @@ class VoiceListenService : Service() {
+             .addAction(0, "Stop", stopPending)
+             .build()
+ 
+-    /** Fork diagnostic: shows what the recognizer heard and what happened, on screen. Transient text only. */
+-    private fun showStatus(text: String) {
+-        Logger.w(TAG, "status: $text")
+-        handler.post {
+-            if (stopping) return@post
+-            try {
+-                getSystemService(NotificationManager::class.java)
+-                    .notify(NOTIFICATION_ID, buildNotification(text))
+-            } catch (e: Exception) {
+-                Logger.w(TAG, "status notify failed: ${e.message}")
+-            }
+-            try {
+-                Toast.makeText(applicationContext, text, Toast.LENGTH_LONG).show()
+-            } catch (e: Exception) {
+-                Logger.w(TAG, "status toast failed: ${e.message}")
+-            }
+-        }
+-    }
+-
+     private fun startForegroundWithNotification() {
+         val nm = getSystemService(NotificationManager::class.java)
+         nm.createNotificationChannel(
+@@ -427,7 +398,6 @@ class VoiceListenService : Service() {
+         // True only here: engine loaded and the wake listener thread is started.
+         running.value = true
+         Logger.w(TAG, "wake stage listening (sherpa keyword spotter)")
+-        refreshHealthNow()
+     }
+ 
+     private fun onKeywordDetected(
+@@ -438,8 +408,6 @@ class VoiceListenService : Service() {
+     ) {
+         if (stopping || myGen != gen || stage != Stage.WAKE) return
+         if (SystemClock.elapsedRealtime() < ignoreWakeUntil) return
+-        val stamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+-        showLastWakeCheck("Wake accepted at $stamp\nkeyword \"$keyword\", tokens [$tokens], timestamps [$times]")
+         enterCommandStage()
+     }
+ 
+@@ -459,15 +427,11 @@ class VoiceListenService : Service() {
+         consecutiveErrors = 0
+         stage = Stage.COMMAND
+         lastCommandPartial = ""
+-        refreshHealthNow()
+         releaseSpeech()
+         // Pause (instead of lowering the volume) so the mic does not hear the music while the
+         // command is captured. Only what we paused is restored, and only if no voice-chosen track starts.
+         pauseForListening()
+         cueDone = false
+-        commandEngine = "not started"
+-        commandError = ""
+-        showStatus("Wake heard. Paused. Say the song name after the beep.")
+         val myGen = gen
+         val starter =
+             Runnable {
+@@ -483,7 +447,6 @@ class VoiceListenService : Service() {
+     private fun startCommandRecognizer() {
+         val m = model ?: return
+         if (startAndroidRecognizer(gen)) return
+-        showStatus("Listening (Vosk fallback; $engineNote). Say the song name.")
+         try {
+             val rec = Recognizer(m, 16000.0f)
+             try {
+@@ -498,12 +461,10 @@ class VoiceListenService : Service() {
+                     it.startListening(SessionListener(gen))
+                 }
+             handler.postDelayed(commandTimeout, COMMAND_TIMEOUT_MS)
+-            commandEngine = "Vosk fallback ($engineNote)"
+             playCueOnce("Vosk listening started")
+             Logger.w(TAG, "command stage listening")
+         } catch (e: Exception) {
+             Logger.e(TAG, "command recognizer failed: ${e.message}")
+-            showStatus("Could not listen for the command. Nothing played. Music stays paused.")
+             enterWakeStage()
+         }
+     }
+@@ -514,41 +475,13 @@ class VoiceListenService : Service() {
+         ignoreWakeUntil = SystemClock.elapsedRealtime() + WAKE_COOLDOWN_MS
+         val text = VoiceQueryGate.clean(rawText)
+         val query = VoiceQueryGate.clean(VoiceCommandParser.commandFrom(text))
+-        Logger.w(TAG, "command heard: '$rawText' -> query '$query'")
+-        val partial = lastCommandPartial
+-        val outcome =
+-            when {
+-                text.isBlank() -> "nothing heard"
+-                VoiceQueryGate.isCancel(query) -> "cancel word"
+-                !VoiceQueryGate.usable(query) -> "not a usable song name"
+-                else -> "sent to search"
+-            }
+-        showLastCommand(
+-            "Last command at ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}\n" +
+-                "Engine: $commandEngine\n" +
+-                "Raw heard: \"$rawText\"\n" +
+-                "Last partial: \"$partial\"\n" +
+-                "Query after parsing: \"$query\"\n" +
+-                "Outcome: $outcome" + (if (commandError.isNotEmpty()) "\nRecognizer: $commandError" else ""),
+-        )
+-        when {
+-            text.isBlank() -> {
+-                showStatus("Heard nothing after the beep. Nothing played. Music stays paused.")
+-            }
+-            VoiceQueryGate.isCancel(query) -> {
+-                showStatus("Cancelled. Resuming what was playing.")
+-                resumeIfPausedByUs()
+-            }
+-            !VoiceQueryGate.usable(query) -> {
+-                showStatus("Heard: \"$text\". Not a clear song name. Nothing played. Music stays paused.")
+-            }
+-            else -> {
+-                showStatus("Heard: \"$text\". Looking for \"$query\"...")
+-                awaitingOutcome = true
+-                handler.removeCallbacks(outcomeTimeout)
+-                handler.postDelayed(outcomeTimeout, OUTCOME_TIMEOUT_MS)
+-                sendQuery(query)
+-            }
++        if (VoiceQueryGate.isCancel(query)) {
++            resumeIfPausedByUs()
++        } else if (text.isNotBlank() && VoiceQueryGate.usable(query)) {
++            awaitingOutcome = true
++            handler.removeCallbacks(outcomeTimeout)
++            handler.postDelayed(outcomeTimeout, OUTCOME_TIMEOUT_MS)
++            sendQuery(query)
+         }
+         enterWakeStage()
+     }
+@@ -574,7 +507,6 @@ class VoiceListenService : Service() {
+         outcome: VoiceOutcome,
+     ) {
+         if (stopping) return
+-        showStatus(message)
+         if (!awaitingOutcome) return
+         when (outcome) {
+             VoiceOutcome.PROGRESS -> {}
+@@ -681,103 +613,15 @@ class VoiceListenService : Service() {
+                 null
+             }
+         val verdict = VoiceWakeGate.judge(VoiceCommandParser.WAKE_PHRASE, text, words)
+-        val mentionsWake = text.contains("hey") || text.contains("zora")
+-        if (mentionsWake) {
+-            val detail = VoiceWakeGate.describe(text, words)
+-            val head = if (verdict is VoiceWakeGate.Verdict.Reject) "Rejected (${verdict.reason})" else "Accepted"
+-            showLastWakeCheck("$head at ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}\n$detail")
+-        }
+         when (verdict) {
+             VoiceWakeGate.Verdict.Accept -> enterCommandStage()
+             is VoiceWakeGate.Verdict.Reject ->
+                 if (text.contains(VoiceCommandParser.WAKE_PHRASE)) {
+-                    Logger.w(TAG, "wake rejected: ${verdict.reason}")
+-                    showStatus("Ignored a wake-like sound (${verdict.reason}).")
+-                }
+-        }
+-    }
+-
+-    /**
+-     * Diagnostic: the latest wake-stage result stays in its own notification that no other status
+-     * overwrites. Text only; nothing recorded or sent anywhere. Replaced by the next wake-like result.
+-     */
+-    /** Diagnostic only: a separate notification with the real microphone state, refreshed every few seconds. */
+-    private val healthTick =
+-        object : Runnable {
+-            override fun run() {
+-                if (stopping) return
+-                try {
+-                    val text =
+-                        micHealth.report(
+-                            stage.name.lowercase(),
+-                            stage == Stage.WAKE,
+-                            SystemClock.elapsedRealtime(),
+-                        )
+-                    val n =
+-                        NotificationCompat
+-                            .Builder(this@VoiceListenService, CHANNEL_ID)
+-                            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+-                            .setContentTitle("Mic health (diagnostic)")
+-                            .setContentText(text.lineSequence().drop(1).firstOrNull() ?: text)
+-                            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+-                            .setOnlyAlertOnce(true)
+-                            .setOngoing(true)
+-                            .build()
+-                    getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID + 2, n)
+-                } catch (e: Exception) {
+-                    Logger.w(TAG, "mic health notify failed: ${e.message}")
++                    // Never log the transcript: the "heard ..." reject reason embeds what the
++                    // recognizer heard. Log the speech-free reasons verbatim, mask that one.
++                    val safeReason = if (verdict.reason.startsWith("heard")) "phrase mismatch" else verdict.reason
++                    Logger.w(TAG, "wake rejected: $safeReason")
+                 }
+-                handler.postDelayed(this, HEALTH_TICK_MS)
+-            }
+-        }
+-
+-    /** Refreshes the mic-health diagnostic notification now and restarts the slow cadence. */
+-    private fun refreshHealthNow() {
+-        handler.removeCallbacks(healthTick)
+-        handler.post(healthTick)
+-    }
+-
+-    private fun showLastCommand(text: String) {
+-        Logger.w(TAG, "last command: $text")
+-        handler.post {
+-            if (stopping) return@post
+-            try {
+-                val n =
+-                    NotificationCompat
+-                        .Builder(this, CHANNEL_ID)
+-                        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+-                        .setContentTitle("Last command")
+-                        .setContentText(text.lineSequence().drop(1).firstOrNull() ?: text)
+-                        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+-                        .setOnlyAlertOnce(true)
+-                        .setAutoCancel(false)
+-                        .build()
+-                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID + 3, n)
+-            } catch (e: Exception) {
+-                Logger.w(TAG, "last command notify failed: ${e.message}")
+-            }
+-        }
+-    }
+-
+-    private fun showLastWakeCheck(text: String) {
+-        Logger.w(TAG, "last wake check: $text")
+-        handler.post {
+-            if (stopping) return@post
+-            try {
+-                val n =
+-                    NotificationCompat
+-                        .Builder(this, CHANNEL_ID)
+-                        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+-                        .setContentTitle("Last wake check")
+-                        .setContentText(text.lineSequence().first())
+-                        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+-                        .setOnlyAlertOnce(true)
+-                        .setAutoCancel(false)
+-                        .build()
+-                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID + 1, n)
+-            } catch (e: Exception) {
+-                Logger.w(TAG, "last wake check notify failed: ${e.message}")
+-            }
+         }
+     }
+ 
+@@ -814,8 +658,6 @@ class VoiceListenService : Service() {
+      */
+     private fun handleRecognizerFault(kind: String) {
+         if (stopping || stage == Stage.LOADING) return
+-        refreshHealthNow()
+-        if (stage == Stage.COMMAND) showStatus("Listening problem. Nothing played. Music stays paused.")
+         consecutiveErrors += 1
+         if (consecutiveErrors >= VoiceStartGate.MAX_CONSECUTIVE_ERRORS) {
+             Logger.e(TAG, "stopping after $consecutiveErrors consecutive recognizer ${kind}s")
+@@ -870,20 +712,11 @@ class VoiceListenService : Service() {
+         androidRecognizer = null
+     }
+ 
+-    private fun cancelHealthNotification() {
+-        try {
+-            getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID + 2)
+-        } catch (_: Exception) {
+-        }
+-    }
+-
+     private fun shutdown() {
+         if (stopping) return
+         stopping = true
+         VoiceDiagnostics.sink = null
+         handler.removeCallbacks(outcomeTimeout)
+-        handler.removeCallbacks(healthTick)
+-        cancelHealthNotification()
+         releaseSpeech()
+         try {
+             spotter?.release()
+@@ -919,8 +752,6 @@ class VoiceListenService : Service() {
+             stopping = true
+             VoiceDiagnostics.sink = null
+             handler.removeCallbacks(outcomeTimeout)
+-            handler.removeCallbacks(healthTick)
+-            cancelHealthNotification()
+             releaseSpeech()
+             try {
+                 spotter?.release()

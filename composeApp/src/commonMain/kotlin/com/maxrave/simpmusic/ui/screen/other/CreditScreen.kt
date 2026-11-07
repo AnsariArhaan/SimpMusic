@@ -116,6 +116,13 @@ fun CreditScreen(
                 },
         )
 
+        // Fork addition: credit for this fork's voice-control modifications. The upstream
+        // author line above and all upstream/library/model credits stay untouched.
+        Text(
+            text = stringResource(Res.string.voice_mod_credit),
+            style = typo().bodyMedium,
+        )
+
         Spacer(modifier = Modifier.height(20.dp))
 
         // App description

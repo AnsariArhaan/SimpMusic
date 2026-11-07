@@ -15,7 +15,6 @@ import com.maxrave.simpmusic.ui.component.SettingItem
 import org.jetbrains.compose.resources.stringResource
 import simpmusic.composeapp.generated.resources.Res
 import simpmusic.composeapp.generated.resources.voice_listen_section
-import simpmusic.composeapp.generated.resources.voice_listen_subtitle
 import simpmusic.composeapp.generated.resources.voice_listen_title
 
 @Composable
@@ -31,7 +30,8 @@ actual fun VoiceListeningSettingGroup() {
     SettingGroup(title = stringResource(Res.string.voice_listen_section)) {
         SettingItem(
             title = stringResource(Res.string.voice_listen_title),
-            subtitle = stringResource(Res.string.voice_listen_subtitle),
+            // No subtitle: the user asked for the switch without the long description text.
+            subtitle = "",
             switch =
                 running to { checked ->
                     if (checked) {

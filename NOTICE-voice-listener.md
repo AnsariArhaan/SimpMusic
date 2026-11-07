@@ -1,5 +1,7 @@
 # Voice listener third-party notices (fork addition)
 
+Voice-control modifications by Arhaan Ansari.
+
 The offline "Hey Zora" voice listener added in this fork (branch arhaan/voice-liked-search,
 core changes carried in patches/voice-wakeword-listener.patch) uses:
 

@@ -52,6 +52,9 @@ jobs:
       - name: Apply battery patch (30s mic-health notification cadence + immediate stage/fault refresh, lazy views search) to core submodule
         run: git -C core apply ../patches/voice-battery-lazy.patch
 
+      - name: Apply clean-UI patch (drop diagnostic notifications, heard-text popups and heard-text local logs; credit notice) to core submodule
+        run: git -C core apply ../patches/voice-clean-ui.patch
+
       - name: Fetch sherpa-onnx v2.0.1 Kotlin API, arm64 libs and KWS model (every file sha256-verified)
         run: |
           set -euo pipefail
