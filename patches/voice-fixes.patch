@@ -156,10 +156,10 @@ index bac97c6..db9929f 100644
              val path =
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 new file mode 100644
-index 0000000..0414afd
+index 0000000..55811a4
 --- /dev/null
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,115 @@
 +package com.maxrave.media3.service.callback
 +
 +/**
@@ -203,7 +203,11 @@ index 0000000..0414afd
 +        val normalized = titles.map { normalize(it) }
 +        val exact = normalized.indices.filter { normalized[it] == wanted }
 +        if (exact.size == 1) return Liked.Play(exact[0])
-+        if (exact.size > 1) return Liked.Ambiguous(exact.take(5))
++        if (exact.size > 1) {
++            // Prefer the plain version over remix/cover tags the user did not ask for.
++            val plain = exact.filter { !isUnaskedVariant(wanted, titles[it]) }
++            return if (plain.size == 1) Liked.Play(plain[0]) else Liked.Ambiguous(exact.take(5))
++        }
 +        // Very short text is too easy to produce from noise: only a whole-title match may play.
 +        if (wanted.length < 4) return Liked.None
 +        val padded = " $wanted "
