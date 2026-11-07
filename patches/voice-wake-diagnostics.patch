@@ -1,0 +1,130 @@
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+index 3c815a8..f5f147d 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceListenService.kt
+@@ -586,22 +586,55 @@ class VoiceListenService : Service() {
+                 } else {
+                     (0 until arr.length()).map { i ->
+                         val o = arr.getJSONObject(i)
+-                        VoiceWakeGate.Word(o.optString("word"), o.optDouble("conf", 0.0), o.optDouble("start", 0.0), o.optDouble("end", 0.0))
++                        VoiceWakeGate.Word(o.optString("word"), if (o.has("conf")) o.optDouble("conf") else null, o.optDouble("start", 0.0), o.optDouble("end", 0.0))
+                     }
+                 }
+             } catch (e: Exception) {
+                 null
+             }
+-        when (val v = VoiceWakeGate.judge(VoiceCommandParser.WAKE_PHRASE, text, words)) {
++        val verdict = VoiceWakeGate.judge(VoiceCommandParser.WAKE_PHRASE, text, words)
++        val mentionsWake = text.contains("hey") || text.contains("zora")
++        if (mentionsWake) {
++            val detail = VoiceWakeGate.describe(text, words)
++            val head = if (verdict is VoiceWakeGate.Verdict.Reject) "Rejected (${verdict.reason})" else "Accepted"
++            showLastWakeCheck("$head at ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}\n$detail")
++        }
++        when (verdict) {
+             VoiceWakeGate.Verdict.Accept -> enterCommandStage()
+             is VoiceWakeGate.Verdict.Reject ->
+                 if (text.contains(VoiceCommandParser.WAKE_PHRASE)) {
+-                    Logger.w(TAG, "wake rejected: ${v.reason}")
+-                    showStatus("Ignored a wake-like sound (${v.reason}).")
++                    Logger.w(TAG, "wake rejected: ${verdict.reason}")
++                    showStatus("Ignored a wake-like sound (${verdict.reason}).")
+                 }
+         }
+     }
+ 
++    /**
++     * Diagnostic: the latest wake-stage result stays in its own notification that no other status
++     * overwrites. Text only; nothing recorded or sent anywhere. Replaced by the next wake-like result.
++     */
++    private fun showLastWakeCheck(text: String) {
++        Logger.w(TAG, "last wake check: $text")
++        handler.post {
++            if (stopping) return@post
++            try {
++                val n =
++                    NotificationCompat
++                        .Builder(this, CHANNEL_ID)
++                        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
++                        .setContentTitle("Last wake check")
++                        .setContentText(text.lineSequence().first())
++                        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
++                        .setOnlyAlertOnce(true)
++                        .setAutoCancel(false)
++                        .build()
++                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID + 1, n)
++            } catch (e: Exception) {
++                Logger.w(TAG, "last wake check notify failed: ${e.message}")
++            }
++        }
++    }
++
+     private fun onResult(hypothesis: String?) {
+         if (stage == Stage.WAKE) onWakeFinal(hypothesis)
+         if (stage == Stage.COMMAND) {
+diff --git a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt
+index 497dfb0..15c75c2 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/voice/VoiceWakeGate.kt
+@@ -17,7 +17,7 @@ internal object VoiceWakeGate {
+ 
+     data class Word(
+         val word: String,
+-        val conf: Double,
++        val conf: Double?,
+         val start: Double,
+         val end: Double,
+     )
+@@ -40,10 +40,26 @@ internal object VoiceWakeGate {
+         val expected = phrase.split(' ')
+         if (words == null || words.size != expected.size) return Verdict.Reject("no word timings")
+         if (words.map { it.word.lowercase() } != expected) return Verdict.Reject("words differ")
+-        val low = words.minOf { it.conf }
++        if (words.any { it.conf == null }) return Verdict.Reject("conf missing")
++        val low = words.minOf { it.conf ?: 0.0 }
+         if (low < MIN_CONFIDENCE) return Verdict.Reject("low confidence ${"%.2f".format(low)}")
+         val span = words.last().end - words.first().start
+         if (span < MIN_SPAN_SECONDS || span > MAX_SPAN_SECONDS) return Verdict.Reject("span ${"%.2f".format(span)}s")
+         return Verdict.Accept
+     }
++
++    /** One-line, text-only account of a wake-stage final: exact words, per-word confidence and timing. */
++    fun describe(
++        text: String,
++        words: List<Word>?,
++    ): String {
++        if (words == null) return "text \"$text\", no word list"
++        val parts =
++            words.joinToString(" | ") {
++                val c = it.conf?.let { v -> "%.2f".format(v) } ?: "missing"
++                "${it.word} conf $c ${"%.2f".format(it.start)}-${"%.2f".format(it.end)}s"
++            }
++        val span = if (words.isEmpty()) "none" else "%.2fs".format(words.last().end - words.first().start)
++        return "text \"$text\": $parts, span $span"
++    }
+ }
+diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt
+index e5e4b48..d417d62 100644
+--- a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt
++++ b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceWakeGateTest.kt
+@@ -23,4 +23,20 @@ class VoiceWakeGateTest {
+         assertTrue(VoiceWakeGate.judge("hey zora", "hey zora", listOf(Word("hey", 1.0, 0.0, 1.0), Word("zora", 1.0, 1.0, 2.5))) is Verdict.Reject)
+         assertTrue(VoiceWakeGate.judge("hey zora", "so hey zora", good) is Verdict.Reject)
+     }
++
++    @Test
++    fun missingConfidenceIsReportedAsMissingNotAsZero() {
++        val w = listOf(Word("hey", null, 0.10, 0.35), Word("zora", 0.95, 0.35, 0.70))
++        val v = VoiceWakeGate.judge("hey zora", "hey zora", w)
++        assertEquals(Verdict.Reject("conf missing"), v)
++        assertTrue(VoiceWakeGate.describe("hey zora", w).contains("conf missing"))
++    }
++
++    @Test
++    fun describeShowsEveryWordAndSpan() {
++        val text = VoiceWakeGate.describe("hey zora", good)
++        assertTrue(text.contains("hey conf 1.00 0.10-0.35s"))
++        assertTrue(text.contains("zora conf 0.95 0.35-0.70s"))
++        assertTrue(text.contains("span 0.60s"))
++    }
+ }

@@ -34,6 +34,9 @@ jobs:
       - name: Apply matching (movie/album, same-title ambiguity) and wake-gate patch to core submodule
         run: git -C core apply ../patches/voice-matching-wake.patch
 
+      - name: Apply wake diagnostics patch (last wake check notification, conf-missing report) to core submodule
+        run: git -C core apply ../patches/voice-wake-diagnostics.patch
+
       - name: Fetch offline speech model (sha256-verified)
         run: |
           curl -fsSL "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" -o "$RUNNER_TEMP/vosk-model.zip"
