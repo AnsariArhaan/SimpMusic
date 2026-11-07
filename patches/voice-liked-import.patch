@@ -1,0 +1,87 @@
+diff --git a/data/src/commonMain/kotlin/DatabaseDao.kt b/data/src/commonMain/kotlin/DatabaseDao.kt
+index 1008052..e1ee9ad 100644
+--- a/data/src/commonMain/kotlin/DatabaseDao.kt
++++ b/data/src/commonMain/kotlin/DatabaseDao.kt
+@@ -270,6 +270,13 @@ interface DatabaseDao {
+         favoriteAt: LocalDateTime? = if (liked == 1) now() else null,
+     )
+ 
++    /** Marks a song liked only if it is not liked already, so existing likes keep their date. */
++    @Query("UPDATE song SET liked = 1, favoriteAt = :favoriteAt WHERE videoId = :videoId AND liked = 0")
++    suspend fun markLikedIfNotLiked(
++        videoId: String,
++        favoriteAt: LocalDateTime,
++    ): Int
++
+     @Insert(onConflict = OnConflictStrategy.Companion.IGNORE)
+     suspend fun insertSong(song: SongEntity): Long
+ 
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt b/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt
+index 78fda48..49aa3ec 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt
+@@ -237,6 +237,11 @@ internal class LocalDataSource(
+      */
+     suspend fun insertSongs(songs: List<SongEntity>) = databaseDao.insertSongs(songs)
+ 
++    suspend fun markLikedIfNotLiked(
++        videoId: String,
++        favoriteAt: kotlinx.datetime.LocalDateTime,
++    ) = databaseDao.markLikedIfNotLiked(videoId, favoriteAt)
++
+     suspend fun updateThumbnailsSongEntity(
+         thumbnail: String,
+         videoId: String,
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt b/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt
+index 3849d23..a674c50 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt
+@@ -1,3 +1,5 @@
++@file:OptIn(kotlin.time.ExperimentalTime::class)
++
+ package com.maxrave.data.repository
+ 
+ import com.maxrave.data.db.datasource.LocalDataSource
+@@ -16,6 +18,10 @@ import kotlinx.coroutines.IO
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.flow
+ import kotlinx.coroutines.flow.flowOn
++import kotlinx.datetime.TimeZone
++import kotlinx.datetime.toLocalDateTime
++import kotlin.time.Clock
++import kotlin.time.Duration.Companion.seconds
+ import kotlinx.serialization.json.Json
+ 
+ private const val TAG = "ImportRepositoryImpl"
+@@ -71,6 +77,16 @@ internal class ImportRepositoryImpl(
+                 var written = 0
+                 data.songs.chunked(SONG_BATCH_SIZE).forEach { chunk ->
+                     localDataSource.insertSongs(chunk.map { it.toSongEntity() })
++                    // Explicit like (never a toggle): works for new rows and rows that already
++                    // existed unliked. Rows that are already liked are left untouched.
++                    val base = Clock.System.now()
++                    chunk.filter { it.liked }.forEach { song ->
++                        val rank = (song.likedRank ?: 0).coerceIn(0, 100000)
++                        val at =
++                            (base - rank.seconds)
++                                .toLocalDateTime(TimeZone.currentSystemDefault())
++                        localDataSource.markLikedIfNotLiked(song.videoId, at)
++                    }
+                     written += chunk.size
+                     emit(ImportProgress.Importing(processed = written, total = total))
+                 }
+diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt
+index f9e0fb0..bb8456b 100644
+--- a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt
++++ b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt
+@@ -37,6 +37,10 @@ data class ImportSong(
+     val isExplicit: Boolean = false,
+     val thumbnails: String? = null,
+     val videoType: String = "",
++    /** When true the song is explicitly marked liked on import (never un-liked). */
++    val liked: Boolean = false,
++    /** 0 = most recently liked. Only orders the liked list; ignored unless [liked] is true. */
++    val likedRank: Int? = null,
+ )
+ 
+ /**

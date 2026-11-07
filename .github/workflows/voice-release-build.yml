@@ -28,6 +28,9 @@ jobs:
       - name: Apply voice fixes (fail-closed play, callback guard, online search) patch to core submodule
         run: git -C core apply ../patches/voice-fixes.patch
 
+      - name: Apply liked-import patch (explicit liked flag on imported songs) to core submodule
+        run: git -C core apply ../patches/voice-liked-import.patch
+
       - name: Fetch offline speech model (sha256-verified)
         run: |
           curl -fsSL "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" -o "$RUNNER_TEMP/vosk-model.zip"
