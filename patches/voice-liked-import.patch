@@ -70,6 +70,191 @@ index 3849d23..a674c50 100644
                      written += chunk.size
                      emit(ImportProgress.Importing(processed = written, total = total))
                  }
+diff --git a/cc/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt b/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt
+new file mode 100644
+index 0000000..2595ab1
+--- /dev/null
++++ b/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt
+@@ -0,0 +1,179 @@
++@file:OptIn(kotlin.time.ExperimentalTime::class)
++
++package com.maxrave.data.repository
++
++import DatabaseDao
++import androidx.room.Room
++import androidx.sqlite.driver.bundled.BundledSQLiteDriver
++import com.maxrave.data.db.Converters
++import com.maxrave.data.db.MusicDatabase
++import com.maxrave.data.db.datasource.LocalDataSource
++import com.maxrave.domain.data.entities.SongEntity
++import com.maxrave.domain.repository.ImportProgress
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.toList
++import kotlinx.coroutines.runBlocking
++import kotlinx.datetime.LocalDateTime
++import kotlin.test.AfterTest
++import kotlin.test.BeforeTest
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * Regression tests for the liked-import path. Nothing is mocked: the real [ImportRepositoryImpl],
++ * the real [LocalDataSource], the real Room DAO and the real [MusicDatabase] schema, on an
++ * in-memory SQLite database (bundled driver, desktop JVM). Android itself is not exercised.
++ */
++class ImportLikedRegressionTest {
++    private lateinit var db: MusicDatabase
++    private lateinit var dao: DatabaseDao
++    private lateinit var repo: ImportRepositoryImpl
++
++    @BeforeTest
++    fun setUp() {
++        db =
++            Room
++                .inMemoryDatabaseBuilder<MusicDatabase>()
++                .addTypeConverter(Converters())
++                .setDriver(BundledSQLiteDriver())
++                .setQueryCoroutineContext(Dispatchers.IO)
++                .build()
++        dao = db.getDatabaseDao()
++        repo = ImportRepositoryImpl(LocalDataSource(dao, db))
++    }
++
++    @AfterTest
++    fun tearDown() {
++        db.close()
++    }
++
++    private fun song(
++        id: String,
++        liked: Boolean,
++        favoriteAt: LocalDateTime? = null,
++        title: String = "orig $id",
++        plays: Long = 0,
++    ) = SongEntity(
++        videoId = id,
++        duration = "3:00",
++        durationSeconds = 180,
++        isAvailable = true,
++        isExplicit = false,
++        likeStatus = "",
++        title = title,
++        videoType = "",
++        category = null,
++        resultType = null,
++        liked = liked,
++        totalPlayTime = plays,
++        favoriteAt = favoriteAt,
++    )
++
++    private fun pack(
++        vararg entries: Triple<String, Boolean, Int?>,
++        title: String = "pack title",
++        playlists: String = "[]",
++    ): String {
++        val songs =
++            entries.joinToString(",") { (id, liked, rank) ->
++                val r = if (rank == null) "" else ""","likedRank":$rank"""
++                """{"videoId":"$id","title":"$title $id","artistName":["A"],"duration":"2:00","durationSeconds":120,"liked":$liked$r}"""
++            }
++        return """{"songs":[$songs],"playlists":$playlists}"""
++    }
++
++    private fun run(json: String): List<ImportProgress> = runBlocking { repo.import(json, "invalid").toList() }
++
++    private fun assertSuccess(p: List<ImportProgress>) = assertTrue(p.last() is ImportProgress.Success, "last=${p.last()}")
++
++    @Test
++    fun newRowIsLikedWithFavoriteAtAndKeepsRankOrder() {
++        assertSuccess(run(pack(Triple("n1", true, 0), Triple("n2", true, 5))))
++        runBlocking {
++            val a = dao.getSong("n1")!!
++            val b = dao.getSong("n2")!!
++            assertTrue(a.liked)
++            assertTrue(b.liked)
++            assertNotNull(a.favoriteAt)
++            assertNotNull(b.favoriteAt)
++            assertTrue(a.favoriteAt!! > b.favoriteAt!!, "rank 0 must be newer than rank 5")
++        }
++    }
++
++    @Test
++    fun existingUnlikedRowBecomesLikedAndKeepsItsOtherData() {
++        runBlocking { dao.insertSong(song("e1", liked = false, title = "mine", plays = 42)) }
++        assertSuccess(run(pack(Triple("e1", true, 0))))
++        runBlocking {
++            val s = dao.getSong("e1")!!
++            assertTrue(s.liked)
++            assertNotNull(s.favoriteAt)
++            assertEquals("mine", s.title)
++            assertEquals(42L, s.totalPlayTime)
++        }
++    }
++
++    @Test
++    fun existingLikedRowIsPreservedIncludingFavoriteAtAndMetadata() {
++        val old = LocalDateTime(2020, 1, 2, 3, 4, 5)
++        runBlocking { dao.insertSong(song("l1", liked = true, favoriteAt = old, title = "keep me", plays = 7)) }
++        assertSuccess(run(pack(Triple("l1", true, 0))))
++        runBlocking {
++            val s = dao.getSong("l1")!!
++            assertTrue(s.liked)
++            assertEquals(old, s.favoriteAt)
++            assertEquals("keep me", s.title)
++            assertEquals(7L, s.totalPlayTime)
++        }
++    }
++
++    @Test
++    fun likedSongNotInThePackIsNeverUnliked() {
++        val old = LocalDateTime(2021, 5, 6, 7, 8, 9)
++        runBlocking { dao.insertSong(song("o1", liked = true, favoriteAt = old)) }
++        assertSuccess(run(pack(Triple("n1", true, 0))))
++        runBlocking {
++            val s = dao.getSong("o1")!!
++            assertTrue(s.liked)
++            assertEquals(old, s.favoriteAt)
++        }
++    }
++
++    @Test
++    fun songWithoutLikedFlagStaysUnlikedAndExistingUnlikedStaysUnliked() {
++        runBlocking { dao.insertSong(song("u1", liked = false)) }
++        assertSuccess(run(pack(Triple("u1", false, null), Triple("u2", false, null))))
++        runBlocking {
++            assertFalse(dao.getSong("u1")!!.liked)
++            assertFalse(dao.getSong("u2")!!.liked)
++        }
++    }
++
++    @Test
++    fun secondImportIsIdempotent() {
++        val json = pack(Triple("a", true, 0), Triple("b", true, 1))
++        assertSuccess(run(json))
++        val first = runBlocking { listOf(dao.getSong("a")!!, dao.getSong("b")!!) }
++        assertSuccess(run(json))
++        runBlocking {
++            val second = listOf(dao.getSong("a")!!, dao.getSong("b")!!)
++            assertEquals(first.map { it.favoriteAt }, second.map { it.favoriteAt })
++            assertTrue(second.all { it.liked })
++        }
++    }
++
++    @Test
++    fun emptyPlaylistsCreateNoPlaylistAndNoDatabaseReplace() {
++        runBlocking { dao.insertSong(song("keep", liked = false)) }
++        assertSuccess(run(pack(Triple("n1", true, 0))))
++        runBlocking {
++            assertTrue(dao.getAllLocalPlaylists(100, 0).isEmpty())
++            assertNotNull(dao.getSong("keep"))
++            assertNull(dao.getSong("missing"))
++        }
++    }
++}
 diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt
 index f9e0fb0..bb8456b 100644
 --- a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt

@@ -58,6 +58,9 @@ jobs:
           printf '%s' "${{ secrets.VOICE_SIGN_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/voice-test.keystore"
           test -s "$RUNNER_TEMP/voice-test.keystore"
 
+      - name: Liked-import regression tests (real importer + real Room DAO, in-memory SQLite, desktop JVM)
+        run: ./gradlew :data:jvmTest --stacktrace
+
       - name: Run unit tests
         run: ./gradlew :media3:testDebugUnitTest --stacktrace
 
