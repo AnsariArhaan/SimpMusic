@@ -67,7 +67,7 @@ index 3677d05..1683b8b 100644
                      is VoiceTitleMatcher.Online.Refuse -> {
                          val shown =
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
-index 8ee769a..59baf71 100644
+index 8ee769a..8efbc3b 100644
 --- a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 @@ -51,6 +51,7 @@ internal object VoiceTitleMatcher {
@@ -192,7 +192,7 @@ index 8ee769a..59baf71 100644
 +        val videoId: String,
 +    )
 +
-+    private val viewsText = Regex("(?i)^\s*([\d.,]+)\s*([KMB]?)\s+views?\s*$")
++    private val viewsText = Regex("(?i)^\\s*([\\d.,]+)\\s*([KMB]?)\\s+views?\\s*$")
 +
 +    /** "760M views" -> 760000000; "No views", unparseable or missing -> null. */
 +    fun parseViews(text: String?): Long? {
