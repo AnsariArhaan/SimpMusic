@@ -156,7 +156,7 @@ index bac97c6..db9929f 100644
              val path =
 diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 new file mode 100644
-index 0000000..55811a4
+index 0000000..b8bed9b
 --- /dev/null
 +++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
 @@ -0,0 +1,115 @@
@@ -195,28 +195,28 @@ index 0000000..55811a4
 +    /** The words to search for, without a trailing "from liked songs" qualifier. */
 +    fun wantedFrom(query: String): String = normalize(query.trim().replace(qualifier, ""))
 +
++    private fun fullNormalize(text: String): String = text.lowercase().replace(nonWord, " ").trim()
++
 +    fun matchLiked(
 +        wanted: String,
 +        titles: List<String>,
 +    ): Liked {
 +        if (wanted.isEmpty()) return Liked.None
-+        val normalized = titles.map { normalize(it) }
-+        val exact = normalized.indices.filter { normalized[it] == wanted }
-+        if (exact.size == 1) return Liked.Play(exact[0])
-+        if (exact.size > 1) {
-+            // Prefer the plain version over remix/cover tags the user did not ask for.
-+            val plain = exact.filter { !isUnaskedVariant(wanted, titles[it]) }
-+            return if (plain.size == 1) Liked.Play(plain[0]) else Liked.Ambiguous(exact.take(5))
-+        }
++        // Titles with a variant tag (remix, cover, live...) the user did not ask for are never candidates,
++        // so "royalty" cannot start a remix, and "royalty remix" cannot fall back to the original.
++        val pool = titles.indices.filter { !isUnaskedVariant(wanted, titles[it]) }
++        fun verdict(hits: List<Int>): Liked? =
++            when (hits.size) {
++                0 -> null
++                1 -> Liked.Play(hits[0])
++                else -> Liked.Ambiguous(hits.take(5))
++            }
++        verdict(pool.filter { fullNormalize(titles[it]) == wanted })?.let { return it }
++        verdict(pool.filter { normalize(titles[it]) == wanted })?.let { return it }
 +        // Very short text is too easy to produce from noise: only a whole-title match may play.
 +        if (wanted.length < 4) return Liked.None
 +        val padded = " $wanted "
-+        val part = normalized.indices.filter { " ${normalized[it]} ".contains(padded) }
-+        return when (part.size) {
-+            0 -> Liked.None
-+            1 -> Liked.Play(part[0])
-+            else -> Liked.Ambiguous(part.take(5))
-+        }
++        return verdict(pool.filter { " ${normalize(titles[it])} ".contains(padded) }) ?: Liked.None
 +    }
 +
 +    private val variantWords =
@@ -869,10 +869,10 @@ index 0000000..9e5d1b7
 +}
 diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
 new file mode 100644
-index 0000000..d088f15
+index 0000000..7647462
 --- /dev/null
 +++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceTitleMatcherTest.kt
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,99 @@
 +package com.maxrave.media3.service.callback
 +
 +import org.junit.Assert.assertEquals
@@ -946,6 +946,30 @@ index 0000000..d088f15
 +    fun heardArtistDetection() {
 +        assertFalse(VoiceTitleMatcher.heardArtist("royalty", "Royalty (feat. X)"))
 +        assertTrue(VoiceTitleMatcher.heardArtist("royalty by egzod", "Royalty"))
++    }
++
++    @Test
++    fun originalBeatsRemixWhenRemixNotAsked() {
++        val l = listOf("Royalty (Remix)", "Royalty", "Royalty (Cover)")
++        assertEquals(VoiceTitleMatcher.Liked.Play(1), VoiceTitleMatcher.matchLiked("royalty", l))
++    }
++
++    @Test
++    fun remixOnlyLikedDoesNotPlayForPlainRequest() {
++        assertEquals(VoiceTitleMatcher.Liked.None, VoiceTitleMatcher.matchLiked("royalty", listOf("Royalty (Remix)")))
++    }
++
++    @Test
++    fun requestedVariantPlaysThatVariantNotTheOriginal() {
++        val l = listOf("Royalty", "Royalty (Remix)")
++        assertEquals(VoiceTitleMatcher.Liked.Play(1), VoiceTitleMatcher.matchLiked("royalty remix", l))
++        assertEquals(VoiceTitleMatcher.Liked.None, VoiceTitleMatcher.matchLiked("royalty remix", listOf("Royalty")))
++    }
++
++    @Test
++    fun noQueryNeverMatches() {
++        assertEquals(VoiceTitleMatcher.Liked.None, VoiceTitleMatcher.matchLiked(VoiceTitleMatcher.wantedFrom("[unk]"), liked))
++        assertEquals(VoiceTitleMatcher.Liked.None, VoiceTitleMatcher.matchLiked("", liked))
 +    }
 +}
 diff --git a/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt b/media/media3/src/test/java/com/maxrave/media3/voice/VoiceQueryGateTest.kt
