@@ -58,6 +58,9 @@ jobs:
       - name: Apply voice18 random-liked patch (exact "play a song" -> random Liked song) to core submodule
         run: git -C core apply ../patches/voice18-random-liked.patch
 
+      - name: Apply voice19 precache-retry patch (failed precached player retried with fresh stream URL; shuffle-aware precache targets) to core submodule
+        run: git -C core apply ../patches/voice19-precache-retry.patch
+
       - name: Fetch sherpa-onnx v2.0.1 Kotlin API, arm64 libs and KWS model (every file sha256-verified)
         run: |
           set -euo pipefail
