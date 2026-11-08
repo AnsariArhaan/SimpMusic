@@ -55,6 +55,9 @@ jobs:
       - name: Apply clean-UI patch (drop diagnostic notifications, heard-text popups and heard-text local logs; credit notice) to core submodule
         run: git -C core apply ../patches/voice-clean-ui.patch
 
+      - name: Apply voice18 random-liked patch (exact "play a song" -> random Liked song) to core submodule
+        run: git -C core apply ../patches/voice18-random-liked.patch
+
       - name: Fetch sherpa-onnx v2.0.1 Kotlin API, arm64 libs and KWS model (every file sha256-verified)
         run: |
           set -euo pipefail

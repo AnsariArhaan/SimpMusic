@@ -1,0 +1,113 @@
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+index e2a49df..ebb7ec1 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/SimpleMediaSessionCallback.kt
+@@ -591,7 +591,32 @@ internal class SimpleMediaSessionCallback(
+                     return
+                 }
+ 
+-                VoiceTitleMatcher.Liked.None -> {}
++                VoiceTitleMatcher.Liked.None -> {
++                    // voice18: the exact generic request "play a song" plays a random Liked song.
++                    // Runs only after the named-title match above missed, so named play is
++                    // unchanged; anything else falls through to the online search as before.
++                    if (VoiceTitleMatcher.isRandomLikedRequest(spoken.full)) {
++                        if (likedSongs.isEmpty()) {
++                            VoiceDiagnostics.report("Not played: no liked songs yet.", VoiceOutcome.NOT_PLAYED)
++                            return
++                        }
++                        val randomIndex = kotlin.random.Random.nextInt(likedSongs.size)
++                        val picked = likedSongs[randomIndex].toTrack()
++                        mediaPlayerHandler.setQueueData(
++                            QueueData.Data(
++                                listTracks = likedSongs.toArrayListTrack(),
++                                firstPlayedTrack = picked,
++                                playlistId = null,
++                                playlistName = context.getString(R.string.favorites),
++                                playlistType = PlaylistType.LOCAL_PLAYLIST,
++                                continuation = null,
++                            ),
++                        )
++                        mediaPlayerHandler.loadMediaItem(picked, Config.PLAYLIST_CLICK, randomIndex)
++                        VoiceDiagnostics.report("Handed \"${titles[randomIndex]}\" (random liked song) to the player.", VoiceOutcome.PLAYED)
++                        return
++                    }
++                }
+             }
+             if (wanted.length < 4) {
+                 VoiceDiagnostics.report("Not played: \"$wanted\" is too short to search safely.", VoiceOutcome.NOT_PLAYED)
+diff --git a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+index 8efbc3b..0bd00ee 100644
+--- a/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
++++ b/media/media3/src/main/java/com/maxrave/media3/service/callback/VoiceTitleMatcher.kt
+@@ -380,6 +380,16 @@ internal object VoiceTitleMatcher {
+         return null
+     }
+ 
++    // ---- Generic random-play request (voice18, approved scope: the exact English phrase only) ----
++
++    /**
++     * True only for the exact generic request "a song" (VoiceCommandParser has already stripped the
++     * leading "play"). Deliberately not a broad set: "song", "music", "anything" and Hindi aliases
++     * were not approved, so they keep the old behavior. Checked AFTER the named-title match, so a
++     * real Liked title can never be hijacked by the generic command.
++     */
++    fun isRandomLikedRequest(wanted: String): Boolean = wanted == "a song"
++
+     /** Liked-songs variant: with a spoken qualifier the album/bracket/artist must agree too. */
+     fun matchLikedQualified(
+         spoken: Spoken,
+diff --git a/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceRandomLikedTest.kt b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceRandomLikedTest.kt
+new file mode 100644
+index 0000000..b458ea8
+--- /dev/null
++++ b/media/media3/src/test/java/com/maxrave/media3/service/callback/VoiceRandomLikedTest.kt
+@@ -0,0 +1,48 @@
++package com.maxrave.media3.service.callback
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Pins the voice18 generic-request gate: only the exact phrase "a song" (what remains after
++ * VoiceCommandParser strips the leading "play") may trigger a random Liked play. Everything else,
++ * including near-misses and unapproved aliases, must keep the old behavior.
++ */
++class VoiceRandomLikedTest {
++    @Test
++    fun exactPhraseIsAccepted() {
++        assertTrue(VoiceTitleMatcher.isRandomLikedRequest("a song"))
++    }
++
++    @Test
++    fun nearMissesAndUnapprovedAliasesAreRejected() {
++        // Not the approved exact phrase: these must NOT random-play.
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("song"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("a songs"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("music"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("anything"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("something"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("gaana"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("kuch bhi"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest(""))
++    }
++
++    @Test
++    fun realTitlesKeepTheirNormalPath() {
++        // A named request must never be treated as the generic one, even when it shares a word.
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("royalty"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("song 2"))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest("write this down a song"))
++    }
++
++    @Test
++    fun parserOutputForPlayASongIsTheGenericPhrase() {
++        // The command parser strips the leading verb: "hey zora play a song" reaches the matcher
++        // as exactly "a song"; other phrasings do not.
++        assertEquals("a song", VoiceTitleMatcher.parse("a song").full)
++        assertTrue(VoiceTitleMatcher.isRandomLikedRequest(VoiceTitleMatcher.parse("a song").full))
++        assertFalse(VoiceTitleMatcher.isRandomLikedRequest(VoiceTitleMatcher.parse("play some music").full))
++    }
++}
