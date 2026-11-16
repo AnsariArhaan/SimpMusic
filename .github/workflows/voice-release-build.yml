@@ -69,6 +69,22 @@ jobs:
            assert len(paths)==14, paths
            for f in paths:subprocess.run(['git','apply',str(root/f)],cwd=out/'core',check=True)
            (out/'NOTICE-voice-listener.md').write_bytes((root/'NOTICE-voice-listener.md').read_bytes())
+          # Adapt the existing voice18 liked-import fixture to upstream's new explicit sync dependency.
+          if variant=='voice':
+           p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt';s=p.read_text()
+           anchor='LocalDataSource(dao, db)';assert s.count(anchor)==1
+           s=s.replace(anchor,'''LocalDataSource(dao, db, com.maxrave.data.librarysync.SyncChangeRecorder(db.getSyncDao(),
+                      com.maxrave.data.librarysync.SyncPrefs(object : androidx.datastore.core.DataStore<androidx.datastore.preferences.core.Preferences> {
+                          private val state = kotlinx.coroutines.flow.MutableStateFlow(androidx.datastore.preferences.core.emptyPreferences())
+                          override val data: kotlinx.coroutines.flow.Flow<androidx.datastore.preferences.core.Preferences> = state
+                          override suspend fun updateData(transform: suspend (androidx.datastore.preferences.core.Preferences) -> androidx.datastore.preferences.core.Preferences): androidx.datastore.preferences.core.Preferences {
+                              val updated = transform(state.value); state.value = updated; return updated
+                          }
+                      }))))''');p.write_text(s)
+          # Upstream desktop-cookie test expected insertion order, but implementation intentionally sorts specificity.
+          p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/browserlogin/BrowserCookieTest.kt';s=p.read_text()
+          assert s.count('assertEquals("SAPISID=domain; music=include", result.cookie)')==1
+          s=s.replace('assertEquals("SAPISID=domain; music=include", result.cookie)','assertEquals("music=include; SAPISID=domain", result.cookie)');p.write_text(s)
           # Corresponding source is delivered with each APK. Private song packs are not inputs.
           (out/'PERSONAL-UPDATE-NOTES.md').write_text('''# Personal SimpMusic 2.6.0 update
           Upstream source: maxrave-dev/SimpMusic 140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05
