@@ -82,6 +82,9 @@ jobs:
           No user data is intentionally cleared. Back up externally before update. Actual phone testing remains necessary.
           Optional computer pairing stays unconfigured unless user sets it up; code-review concerns remain documented separately.
           ''')
+          # Upstream JVM regression helper accepts null in its own tests, as production SyncChangeEntity does.
+          p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/librarysync/SyncSupportTest.kt';s=p.read_text();assert s.count('value: String = ON')==1
+          s=s.replace('value: String = ON','value: String? = ON');p.write_text(s)
           # Exercise Room's real generated 27->28 migration on a file created from the published v27 schema.
           schema=json.loads((out/'core/data/schemas/com.maxrave.data.db.MusicDatabase/27.json').read_text())['database']
           sql=[]
