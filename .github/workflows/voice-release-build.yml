@@ -1,64 +1,155 @@
-name: Build optimized release APK (voice liked-songs test)
-
+name: Build reviewed 2.6.0 base and Zora updates
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, voice]
+    env:
+      VARIANT: ${{ matrix.variant }}
     steps:
-      - name: Check out repository with core submodule
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check out exact delivered voice18 source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          submodules: recursive
-
-      - name: Apply voice liked-songs patch to core submodule
-        run: git -C core apply ../patches/voice-liked-search.patch
-
-      - name: Apply voice wake-word listener patch to core submodule
-        run: git -C core apply ../patches/voice-wakeword-listener.patch
-
-      - name: Apply voice diagnostics (heard-text) patch to core submodule
-        run: git -C core apply ../patches/voice-diagnostics.patch
-
-      - name: Apply voice fixes (fail-closed play, callback guard, online search) patch to core submodule
-        run: git -C core apply ../patches/voice-fixes.patch
-
-      - name: Apply liked-import patch (explicit liked flag on imported songs) to core submodule
-        run: git -C core apply ../patches/voice-liked-import.patch
-
-      - name: Apply matching (movie/album, same-title ambiguity) and wake-gate patch to core submodule
-        run: git -C core apply ../patches/voice-matching-wake.patch
-
-      - name: Apply wake diagnostics patch (last wake check notification, conf-missing report) to core submodule
-        run: git -C core apply ../patches/voice-wake-diagnostics.patch
-
-      - name: Apply sherpa-onnx keyword-spotter wake patch to core submodule
-        run: git -C core apply ../patches/voice-sherpa-wake.patch
-
-      - name: Apply mic health diagnostic patch (callback, stage, frames, peak, input device) to core submodule
-        run: git -C core apply ../patches/voice-mic-health.patch
-
-      - name: Apply command cue, search-phrase hint and last-command record patch to core submodule
-        run: git -C core apply ../patches/voice-command-cue.patch
-
-      - name: Apply match-popularity patch (spelling tolerance + most-played tie-break, views pipeline) to core submodule
-        run: git -C core apply ../patches/voice-match-popularity.patch
-
-      - name: Apply battery patch (30s mic-health notification cadence + immediate stage/fault refresh, lazy views search) to core submodule
-        run: git -C core apply ../patches/voice-battery-lazy.patch
-
-      - name: Apply clean-UI patch (drop diagnostic notifications, heard-text popups and heard-text local logs; credit notice) to core submodule
-        run: git -C core apply ../patches/voice-clean-ui.patch
-
-      - name: Apply voice18 random-liked patch (exact "play a song" -> random Liked song) to core submodule
-        run: git -C core apply ../patches/voice18-random-liked.patch
-
+          ref: f3ddfa2a75b12252280e731aa68d98e214bfd085
+          persist-credentials: false
+      - name: Prepare pinned official update and personal variant
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/prepare-update.py" <<'PY'
+          import pathlib, subprocess, re, os, json
+          root=pathlib.Path(os.environ['GITHUB_WORKSPACE']); out=root/'prepared'; variant=os.environ['VARIANT']
+          assert variant in ['base','voice']
+          out.mkdir(exist_ok=True)
+          subprocess.run(['git','fetch','--no-tags','https://github.com/maxrave-dev/SimpMusic.git','140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05'],check=True)
+          with subprocess.Popen(['git','archive','140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05'],stdout=subprocess.PIPE) as p:
+           subprocess.run(['tar','-x','-C',str(out)],stdin=p.stdout,check=True); assert p.wait()==0
+          subprocess.run(['git','clone','--filter=blob:none','--no-checkout','https://github.com/maxrave-dev/core.git',str(out/'core')],check=True)
+          subprocess.run(['git','checkout','--detach','8413a257cbe45d102a9f101f2760e35b549e4d9e'],cwd=out/'core',check=True)
+          # Same personal application ID and signing key for both alternative builds.
+          p=out/'androidApp/build.gradle.kts';s=p.read_text();anchor='    buildTypes {'
+          assert s.count(anchor)==1
+          s=s.replace(anchor,'''    signingConfigs {
+                  create("voiceTest") {
+                      storeFile = System.getenv("SIGN_STORE_FILE")?.let { file(it) }
+                      storePassword = System.getenv("SIGN_STORE_PASSWORD")
+                      keyAlias = System.getenv("SIGN_KEY_ALIAS")
+                      keyPassword = System.getenv("SIGN_KEY_PASSWORD")
+                  }
+              }
+          '''+anchor)
+          s=s.replace('            isShrinkResources = true','''            isShrinkResources = true
+                      applicationIdSuffix = ".dev"
+                      versionNameSuffix = "-'''+('base' if variant=='base' else 'zora')+'''"
+                      signingConfig = signingConfigs.getByName("voiceTest")''');p.write_text(s)
+          p=out/'gradle/libs.versions.toml';s=p.read_text();assert 'version-code = "63"' in s;assert 'commonsIo = "2.5"' in s
+          s=s.replace('version-code = "63"','version-code = "'+('66' if variant=='base' else '67')+'"').replace('commonsIo = "2.5"','commonsIo = "2.22.0"');p.write_text(s)
+          p=out/'gradle.properties';s=p.read_text().replace('isFullBuild=true','isFullBuild=false');assert 'isFullBuild=false' in s;p.write_text(s)
+          # Preserve the existing personal-fork compatibility fix. No official signature is forged.
+          p=out/'androidApp/src/main/java/com/maxrave/simpmusic/MainActivity.kt';s=p.read_text();line='        if (!BuildConfig.DEBUG) viewModel.checkOfficialBuild(packageName, signingCertSha256())\n';assert s.count(line)==1;s=s.replace(line,'');p.write_text(s)
+          if variant=='voice':
+           # Exact existing voice18 changes, with only two moved resource/settings anchors adapted.
+           files=['androidApp/src/main/AndroidManifest.xml','composeApp/src/androidMain/kotlin/com/maxrave/simpmusic/expect/ui/VoiceListening.android.kt','composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/expect/ui/VoiceListening.kt','composeApp/src/jvmMain/kotlin/com/maxrave/simpmusic/expect/ui/VoiceListening.jvm.kt']
+           for f in files:
+            src=root/f;dest=out/f;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(src.read_bytes())
+           p=out/'composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/ui/screen/other/CreditScreen.kt';s=p.read_text();anchor='        // App description';assert s.count(anchor)==1
+           s=s.replace(anchor,'        Text(text = stringResource(Res.string.voice_mod_credit), style = typo().bodyMedium)\n        Spacer(modifier = Modifier.height(20.dp))\n\n'+anchor);p.write_text(s)
+           p=out/'composeApp/src/commonMain/composeResources/values/strings.xml';s=p.read_text();assert s.count('</resources>')==1
+           s=s.replace('</resources>','    <string name="voice_listen_section">Voice listening</string>\n    <string name="voice_listen_title">Hands-free listening ("Hey Zora")</string>\n    <string name="voice_mod_credit">Voice-control modifications by Arhaan Ansari</string>\n</resources>');p.write_text(s)
+           p=out/'composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/ui/screen/home/SettingScreen.kt';s=p.read_text();anchor='import com.maxrave.simpmusic.expect.ui.LoginSyncDialog';assert s.count(anchor)==1;s=s.replace(anchor,'import com.maxrave.simpmusic.expect.ui.VoiceListeningSettingGroup\n'+anchor)
+           anchor='        item(key = "discord") {';assert s.count(anchor)==1;s=s.replace(anchor,'        item(key = "voiceListening") {\n            VoiceListeningSettingGroup()\n        }\n'+anchor);p.write_text(s)
+           text=(root/'.github/workflows/voice-release-build.yml').read_text()
+           paths=re.findall(r'run: git -C core apply ../(patches/[^\n]+)',text)
+           assert len(paths)==14, paths
+           for f in paths:subprocess.run(['git','apply',str(root/f)],cwd=out/'core',check=True)
+           (out/'NOTICE-voice-listener.md').write_bytes((root/'NOTICE-voice-listener.md').read_bytes())
+          # Corresponding source is delivered with each APK. Private song packs are not inputs.
+          (out/'PERSONAL-UPDATE-NOTES.md').write_text('''# Personal SimpMusic 2.6.0 update
+          Upstream source: maxrave-dev/SimpMusic 140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05
+          Core source: maxrave-dev/core 8413a257cbe45d102a9f101f2760e35b549e4d9e
+          Variant: '''+variant+'''
+          Update compatibility and dependency changes by Arhaan Ansari.
+          Same personal .dev application ID and signing configuration; Commons IO 2.22.0.
+          All upstream and third-party licences/credits retained. This is not an official signed release.
+          The APKs are alternatives and cannot coexist under the same personal package. Installing both is not required. Base omits the custom hands-free pack. Base versionCode66 can update voice18; Zora versionCode67 can update either voice18 or base. Android will not install lower-code base66 over Zora67. Do not uninstall to bypass this; request a newer base build if switching back.
+          Voice build retains voice18 behavior, not the previously held voice19 retry candidate.
+          No user data is intentionally cleared. Back up externally before update. Actual phone testing remains necessary.
+          Optional computer pairing stays unconfigured unless user sets it up; code-review concerns remain documented separately.
+          ''')
+          # Exercise Room's real generated 27->28 migration on a file created from the published v27 schema.
+          schema=json.loads((out/'core/data/schemas/com.maxrave.data.db.MusicDatabase/27.json').read_text())['database']
+          sql=[]
+          for t in schema['entities']:
+           sql.append(t['createSql'].replace('${TABLE_NAME}',t['tableName']))
+           for idx in t.get('indices',[]):sql.append(idx['createSql'].replace('${TABLE_NAME}',t['tableName']).replace('${INDEX_NAME}',idx['name']))
+          sql+=schema['setupQueries'];sql+=['PRAGMA user_version=27',"INSERT INTO song(videoId,duration,durationSeconds,isAvailable,isExplicit,likeStatus,title,videoType,liked,totalPlayTime,downloadState,favoriteAt,inLibrary) VALUES('migration-kept','3:00',180,1,0,'LIKE','Kept liked download','MUSIC',1,123,3,1700000000000,1)"]
+          # Dollar escape is required in Kotlin normal strings; schema placeholders were replaced above.
+          def kt(x):return json.dumps(x).replace('$','\\$')
+          body='\n'.join('                db.execSQL('+kt(x)+')' for x in sql)
+          test='''package com.maxrave.data.db
+          import androidx.room.Room
+          import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+          import androidx.sqlite.execSQL
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.runBlocking
+          import java.nio.file.Files
+          import kotlin.test.Test
+          import kotlin.test.assertEquals
+          import kotlin.test.assertNotNull
+          class PersonalUpdateMigrationTest {
+              @Test fun actualGenerated27To28KeepsLikedDownload() = runBlocking {
+                  val folder=Files.createTempDirectory("simpmusic-migration-").toFile()
+                  val file=folder.resolve("old27.db")
+                  try {
+                      BundledSQLiteDriver().open(file.absolutePath).use { db ->
+          '''+body+'''
+                      }
+                      val upgraded=Room.databaseBuilder<MusicDatabase>(name=file.absolutePath)
+                          .addTypeConverter(Converters()).setDriver(BundledSQLiteDriver())
+                          .setQueryCoroutineContext(Dispatchers.IO).build()
+                      try {
+                          val song=assertNotNull(upgraded.getDatabaseDao().getSong("migration-kept"))
+                          assertEquals("Kept liked download",song.title)
+                          assertEquals(true,song.liked)
+                          assertEquals(3,song.downloadState)
+                          assertEquals(123L,song.totalPlayTime)
+                      } finally { upgraded.close() }
+                      BundledSQLiteDriver().open(file.absolutePath).use { db ->
+                          db.prepare("PRAGMA user_version").use { row ->
+                              check(row.step());assertEquals(28L,row.getLong(0))
+                          }
+                          db.prepare("PRAGMA integrity_check").use { row ->
+                              check(row.step());assertEquals("ok",row.getText(0))
+                          }
+                      }
+                  } finally { folder.deleteRecursively() }
+              }
+          }
+          '''
+          p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/db/PersonalUpdateMigrationTest.kt';p.parent.mkdir(parents=True,exist_ok=True);p.write_text(test)
+          print('Prepared',variant,'with old-data migration regression test')
+          PY
+          python "$RUNNER_TEMP/prepare-update.py"
+      - name: Verify old signing certificate before any build
+        env:
+          KEYSTORE_B64: ${{ secrets.VOICE_SIGN_KEYSTORE_B64 }}
+          STORE_PASS: ${{ secrets.VOICE_SIGN_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.VOICE_SIGN_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/voice-test.keystore"
+          test -s "$RUNNER_TEMP/voice-test.keystore"
+          keytool -exportcert -alias "$KEY_ALIAS" -keystore "$RUNNER_TEMP/voice-test.keystore" -storepass:env STORE_PASS -file "$RUNNER_TEMP/voice-cert.der"
+          echo "65e4f2d45b70c95b1ea21e647e52a0a9153b5f7723771db30ae54feb65388c9f  $RUNNER_TEMP/voice-cert.der" | sha256sum -c -
       - name: Fetch sherpa-onnx v2.0.1 Kotlin API, arm64 libs and KWS model (every file sha256-verified)
+        if: matrix.variant == 'voice'
+        working-directory: prepared
         run: |
           set -euo pipefail
           T="$RUNNER_TEMP/sherpa"; mkdir -p "$T"
@@ -104,6 +195,8 @@ jobs:
           )
 
       - name: Fetch offline speech model (sha256-verified)
+        if: matrix.variant == 'voice'
+        working-directory: prepared
         run: |
           curl -fsSL "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" -o "$RUNNER_TEMP/vosk-model.zip"
           echo "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498  $RUNNER_TEMP/vosk-model.zip" | sha256sum -c -
@@ -114,52 +207,61 @@ jobs:
           printf 'simpmusic-voice-en-us-1' > core/media/media3/src/main/assets/model-en-us/uuid
 
       - name: Set up JDK 21
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
         with:
           java-version: 21
           distribution: microsoft
           cache: gradle
-
-      - name: Use FOSS flavor (fail closed if flag is not FOSS)
-        run: |
-          sed -i 's/^isFullBuild=true/isFullBuild=false/' gradle.properties
-          grep -qx 'isFullBuild=false' gradle.properties
-
-      - name: Decode signing keystore from secrets
-        run: |
-          printf '%s' "${{ secrets.VOICE_SIGN_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/voice-test.keystore"
-          test -s "$RUNNER_TEMP/voice-test.keystore"
-
-      - name: Liked-import regression tests (real importer + real Room DAO, in-memory SQLite, desktop JVM)
-        run: ./gradlew :data:jvmTest --stacktrace
-
-      - name: Run unit tests
+      - name: Real Room migration, data regression and sync tests
+        working-directory: prepared
+        run: ./gradlew :data:jvmTest :loginSync:jvmTest --stacktrace
+      - name: Media, 8D and voice unit tests
+        working-directory: prepared
         run: ./gradlew :media3:testDebugUnitTest --stacktrace
-
-      - name: Build optimized release-dev APK
+      - name: Build optimized personal update
+        working-directory: prepared
         run: ./gradlew :androidApp:assembleRelease --stacktrace
         env:
           SIGN_STORE_FILE: ${{ runner.temp }}/voice-test.keystore
           SIGN_STORE_PASSWORD: ${{ secrets.VOICE_SIGN_STORE_PASSWORD }}
           SIGN_KEY_ALIAS: ${{ secrets.VOICE_SIGN_KEY_ALIAS }}
           SIGN_KEY_PASSWORD: ${{ secrets.VOICE_SIGN_KEY_PASSWORD }}
-
-      - name: Verify APK is non-debuggable and inspect signature
+      - name: Verify exact APK identity, signature, model inclusion and release flags
         run: |
-          set -e
+          set -euo pipefail
           BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
-          APK=$(find androidApp/build/outputs/apk -name '*arm64-v8a*.apk' | head -1)
+          APK=$(find prepared/androidApp/build/outputs/apk -name '*arm64-v8a*.apk' | head -1)
           test -n "$APK"
-          if "$BT/aapt" dump badging "$APK" | grep -q 'application-debuggable'; then
-            echo 'APK is debuggable - failing'
-            exit 1
+          mkdir -p deliver
+          OUT="deliver/SimpMusic-2.6.0-${VARIANT}-arm64.apk"
+          cp "$APK" "$OUT"
+          "$BT/aapt" dump badging "$OUT" | tee deliver/identity.txt
+          grep -q "package: name='com.maxrave.simpmusic.dev'" deliver/identity.txt
+          if grep -q 'application-debuggable' deliver/identity.txt; then exit 1; fi
+          unzip -l "$OUT" > deliver/zip-list.txt
+          if [ "$VARIANT" = base ]; then
+            grep -q "versionCode='66'" deliver/identity.txt
+            if grep -q 'assets/kws/' deliver/zip-list.txt; then echo 'Unexpected voice model in base'; exit 1; fi
+          else
+            grep -q "versionCode='67'" deliver/identity.txt
+            grep 'assets/kws/tokens.txt' deliver/zip-list.txt
+            grep 'assets/model-en-us/uuid' deliver/zip-list.txt
           fi
-          "$BT/aapt" dump badging "$APK" | grep -m1 '^package:'
-          "$BT/apksigner" verify --print-certs "$APK" | grep -m1 'SHA-256'
-
-      - name: Upload APK
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+          "$BT/apksigner" verify --verbose --print-certs "$OUT" | tee deliver/signature.txt
+          grep -q '65e4f2d45b70c95b1ea21e647e52a0a9153b5f7723771db30ae54feb65388c9f' deliver/signature.txt
+          unzip -t "$OUT" | tail -1
+          sha256sum "$OUT" | tee deliver/SHA256SUMS.txt
+          cp prepared/PERSONAL-UPDATE-NOTES.md deliver/
+          # Full corresponding modified source and native/model assets, no signing key or credentials.
+          tar --exclude='.git' --exclude='build' --exclude='.gradle' --exclude='.kotlin' -czf "deliver/SimpMusic-2.6.0-${VARIANT}-source.tar.gz" -C prepared .
+          sha256sum "deliver/SimpMusic-2.6.0-${VARIANT}-source.tar.gz" >> deliver/SHA256SUMS.txt
+      - name: Upload verified APK, source and test reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: simpmusic-voice-release-apk
-          path: androidApp/build/outputs/apk/
+          name: simpmusic-260-${{ matrix.variant }}
+          path: |
+            deliver/
+            prepared/core/data/build/reports/tests/
+            prepared/core/media/media3/build/reports/tests/
+            prepared/core/service/loginSync/build/reports/tests/
           retention-days: 7
