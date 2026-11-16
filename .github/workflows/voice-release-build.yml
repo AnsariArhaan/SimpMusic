@@ -1,6 +1,13 @@
 name: Build reviewed 2.6.0 base and Zora updates
 on:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: Variant selection
+        required: true
+        default: both
+        type: choice
+        options: [both, base, voice]
 permissions:
   contents: read
 jobs:
@@ -10,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, voice]
+        variant: ${{ fromJSON(inputs.variant == 'voice' && '["voice"]' || inputs.variant == 'base' && '["base"]' || '["base","voice"]') }}
     env:
       VARIANT: ${{ matrix.variant }}
     steps:
@@ -80,7 +87,7 @@ jobs:
                           override suspend fun updateData(transform: suspend (androidx.datastore.preferences.core.Preferences) -> androidx.datastore.preferences.core.Preferences): androidx.datastore.preferences.core.Preferences {
                               val updated = transform(state.value); state.value = updated; return updated
                           }
-                      }))))''');p.write_text(s)
+                      })))''');p.write_text(s)
           # Upstream desktop-cookie test expected insertion order, but implementation intentionally sorts specificity.
           p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/browserlogin/BrowserCookieTest.kt';s=p.read_text()
           assert s.count('assertEquals("SAPISID=domain; music=include", result.cookie)')==1
