@@ -1,4 +1,4 @@
-name: Build reviewed 2.6.0 base and Zora updates
+name: Build reviewed 2.6.0 base, Zora and liked-sort updates
 on:
   workflow_dispatch:
     inputs:
@@ -7,7 +7,7 @@ on:
         required: true
         default: both
         type: choice
-        options: [both, base, voice]
+        options: [both, base, voice, sort]
 permissions:
   contents: read
 jobs:
@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: ${{ fromJSON(inputs.variant == 'voice' && '["voice"]' || inputs.variant == 'base' && '["base"]' || '["base","voice"]') }}
+        variant: ${{ fromJSON(inputs.variant == 'voice' && '["voice"]' || inputs.variant == 'base' && '["base"]' || inputs.variant == 'sort' && '["sort"]' || '["base","voice"]') }}
     env:
       VARIANT: ${{ matrix.variant }}
     steps:
@@ -32,7 +32,7 @@ jobs:
           cat > "$RUNNER_TEMP/prepare-update.py" <<'PY'
           import pathlib, subprocess, re, os, json
           root=pathlib.Path(os.environ['GITHUB_WORKSPACE']); out=root/'prepared'; variant=os.environ['VARIANT']
-          assert variant in ['base','voice']
+          assert variant in ['base','voice','sort']
           out.mkdir(exist_ok=True)
           subprocess.run(['git','fetch','--no-tags','https://github.com/maxrave-dev/SimpMusic.git','140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05'],check=True)
           with subprocess.Popen(['git','archive','140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05'],stdout=subprocess.PIPE) as p:
@@ -53,10 +53,10 @@ jobs:
           '''+anchor)
           s=s.replace('            isShrinkResources = true','''            isShrinkResources = true
                       applicationIdSuffix = ".dev"
-                      versionNameSuffix = "-'''+('base' if variant=='base' else 'zora')+'''"
+                      versionNameSuffix = "-'''+('base' if variant=='base' else ('sort' if variant=='sort' else 'zora'))+'''"
                       signingConfig = signingConfigs.getByName("voiceTest")''');p.write_text(s)
           p=out/'gradle/libs.versions.toml';s=p.read_text();assert 'version-code = "63"' in s;assert 'commonsIo = "2.5"' in s
-          s=s.replace('version-code = "63"','version-code = "'+('66' if variant=='base' else '67')+'"').replace('commonsIo = "2.5"','commonsIo = "2.22.0"');p.write_text(s)
+          s=s.replace('version-code = "63"','version-code = "'+('66' if variant=='base' else ('68' if variant=='sort' else '67'))+'"').replace('commonsIo = "2.5"','commonsIo = "2.22.0"');p.write_text(s)
           p=out/'gradle.properties';s=p.read_text().replace('isFullBuild=true','isFullBuild=false');assert 'isFullBuild=false' in s;p.write_text(s)
           # Preserve the existing personal-fork compatibility fix. No official signature is forged.
           p=out/'androidApp/src/main/java/com/maxrave/simpmusic/MainActivity.kt';s=p.read_text();line='        if (!BuildConfig.DEBUG) viewModel.checkOfficialBuild(packageName, signingCertSha256())\n';assert s.count(line)==1;s=s.replace(line,'');p.write_text(s)
@@ -76,8 +76,12 @@ jobs:
            assert len(paths)==14, paths
            for f in paths:subprocess.run(['git','apply',str(root/f)],cwd=out/'core',check=True)
            (out/'NOTICE-voice-listener.md').write_bytes((root/'NOTICE-voice-listener.md').read_bytes())
+          if variant=='sort':
+           # Liked-sort update: liked-import patch (shared with voice) plus the autosort patch. No voice files.
+           for f in ['patches/voice-liked-import.patch','patches/voice-liked-autosort.patch']:
+            subprocess.run(['git','apply',str(root/f)],cwd=out/'core',check=True)
           # Adapt the existing voice18 liked-import fixture to upstream's new explicit sync dependency.
-          if variant=='voice':
+          if variant in ('voice','sort'):
            p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt';s=p.read_text()
            anchor='LocalDataSource(dao, db)';assert s.count(anchor)==1
            s=s.replace(anchor,'''LocalDataSource(dao, db, com.maxrave.data.librarysync.SyncChangeRecorder(db.getSyncDao(),
@@ -88,6 +92,60 @@ jobs:
                               val updated = transform(state.value); state.value = updated; return updated
                           }
                       })))''');p.write_text(s)
+          if variant=='sort':
+           # Liked-songs sorting UI: one-time sort button in Settings > Backup, result toasts, credit.
+           p=out/'composeApp/src/commonMain/composeResources/values/strings.xml';s=p.read_text();assert s.count('</resources>')==1
+           s=s.replace('</resources>','    <string name="liked_sort_title">Sort liked songs</string>\n    <string name="liked_sort_subtitle">File every liked song into the Phonk, English and Hindi playlists. New likes are sorted automatically.</string>\n    <string name="liked_sort_done">Liked songs sorted - %1$d added to the Phonk, English and Hindi playlists</string>\n    <string name="liked_sort_failed">Could not sort liked songs</string>\n    <string name="liked_sort_mod_credit">Liked-songs sorting by Arhaan Ansari</string>\n</resources>');p.write_text(s)
+           p=out/'composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/ui/screen/home/SettingScreen.kt';s=p.read_text()
+           anchor='import simpmusic.composeapp.generated.resources.import_data\n';assert s.count(anchor)==1
+           s=s.replace(anchor,anchor+'import simpmusic.composeapp.generated.resources.liked_sort_subtitle\nimport simpmusic.composeapp.generated.resources.liked_sort_title\n')
+           anchor='''                SettingItem(
+                              title = stringResource(Res.string.import_data),
+                              subtitle = stringResource(Res.string.import_playlists_from_other_apps),
+                              onClick = {
+                                  coroutineScope.launch {
+                                      importLauncher.launch()
+                                  }
+                              },
+                          )''';assert s.count(anchor)==1
+           s=s.replace(anchor,anchor+'''
+                          SettingItem(
+                              title = stringResource(Res.string.liked_sort_title),
+                              subtitle = stringResource(Res.string.liked_sort_subtitle),
+                              onClick = {
+                                  coroutineScope.launch {
+                                      viewModel.sortLikedSongsIntoBuckets()
+                                  }
+                              },
+                          )''');p.write_text(s)
+           p=out/'composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/viewModel/SettingsViewModel.kt';s=p.read_text()
+           anchor='import simpmusic.composeapp.generated.resources.backup_create_failed\n';assert s.count(anchor)==1
+           s=s.replace(anchor,anchor+'import simpmusic.composeapp.generated.resources.liked_sort_done\nimport simpmusic.composeapp.generated.resources.liked_sort_failed\n')
+           anchor='''    fun setBackupDownloaded(backupDownloaded: Boolean) {
+                  viewModelScope.launch {
+                      dataStoreManager.setBackupDownloaded(backupDownloaded)
+                      getBackupDownloaded()
+                  }
+              }''';assert s.count(anchor)==1
+           s=s.replace(anchor,anchor+'''
+
+              /** One-time pass over the liked library into the Phonk / English / Hindi bucket playlists. */
+              fun sortLikedSongsIntoBuckets() {
+                  viewModelScope.launch {
+                      runCatching { songRepository.sortAllLikedSongsIntoBuckets() }
+                          .onSuccess { result ->
+                              makeToast(
+                                  formatString(
+                                      Res.string.liked_sort_done,
+                                      result.phonkAdded + result.englishAdded + result.hindiAdded,
+                                  ),
+                              )
+                          }
+                          .onFailure { makeToast(getString(Res.string.liked_sort_failed)) }
+                  }
+              }''');p.write_text(s)
+           p=out/'composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/ui/screen/other/CreditScreen.kt';s=p.read_text();anchor='        // App description';assert s.count(anchor)==1
+           s=s.replace(anchor,'        Text(text = stringResource(Res.string.liked_sort_mod_credit), style = typo().bodyMedium)\n        Spacer(modifier = Modifier.height(20.dp))\n\n'+anchor);p.write_text(s)
           # Upstream desktop-cookie test expected insertion order, but implementation intentionally sorts specificity.
           p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/browserlogin/BrowserCookieTest.kt';s=p.read_text()
           assert s.count('assertEquals("SAPISID=domain; music=include", result.cookie)')==1
@@ -105,6 +163,8 @@ jobs:
           No user data is intentionally cleared. Back up externally before update. Actual phone testing remains necessary.
           Optional computer pairing stays unconfigured unless user sets it up; code-review concerns remain documented separately.
           ''')
+          if variant=='sort':
+           p=out/'PERSONAL-UPDATE-NOTES.md';p.write_text(p.read_text()+'Sort variant: liked-songs bucket playlists (Phonk / English / Hindi) with a one-time sort button in Settings and automatic sorting of new likes. No voice pack included.\n')
           # Upstream JVM regression helper accepts null in its own tests, as production SyncChangeEntity does.
           p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/librarysync/SyncSupportTest.kt';s=p.read_text();assert s.count('value: String = ON')==1
           s=s.replace('value: String = ON','value: String? = ON');p.write_text(s)
@@ -268,6 +328,9 @@ jobs:
           if [ "$VARIANT" = base ]; then
             grep -q "versionCode='66'" deliver/identity.txt
             if grep -q 'assets/kws/' deliver/zip-list.txt; then echo 'Unexpected voice model in base'; exit 1; fi
+          elif [ "$VARIANT" = sort ]; then
+            grep -q "versionCode='68'" deliver/identity.txt
+            if grep -q 'assets/kws/' deliver/zip-list.txt; then echo 'Unexpected voice model in sort'; exit 1; fi
           else
             grep -q "versionCode='67'" deliver/identity.txt
             grep 'assets/kws/tokens.txt' deliver/zip-list.txt

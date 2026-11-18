@@ -1,0 +1,860 @@
+diff --git a/data/src/commonMain/kotlin/DatabaseDao.kt b/data/src/commonMain/kotlin/DatabaseDao.kt
+index c38b08c..f377e02 100644
+--- a/data/src/commonMain/kotlin/DatabaseDao.kt
++++ b/data/src/commonMain/kotlin/DatabaseDao.kt
+@@ -705,6 +705,13 @@ interface DatabaseDao {
+         id: Long,
+     )
+ 
++    /**
++     * Title lookup for the personal bucket playlists. `ORDER BY id ASC LIMIT 1` picks the oldest
++     * when a playlist title exists more than once, which keeps the sorter anchored to one row.
++     */
++    @Query("SELECT * FROM local_playlist WHERE title = :title ORDER BY id ASC LIMIT 1")
++    suspend fun getLocalPlaylistByTitle(title: String): LocalPlaylistEntity?
++
+     @Query("UPDATE local_playlist SET thumbnail = :thumbnail WHERE id = :id")
+     suspend fun updateLocalPlaylistThumbnail(
+         thumbnail: String,
+@@ -837,6 +844,19 @@ interface DatabaseDao {
+         localPlaylistId: Long,
+     ): PairSongLocalPlaylist
+ 
++    /** Nullable twin of [getPlaylistPairOfSong] - absence of a pair is the expected case here. */
++    @Query("SELECT * FROM pair_song_local_playlist WHERE songId = :videoId AND playlistId = :localPlaylistId LIMIT 1")
++    suspend fun findPlaylistPairOfSongNullable(
++        videoId: String,
++        localPlaylistId: Long,
++    ): PairSongLocalPlaylist?
++
++    @Query("DELETE FROM pair_song_local_playlist WHERE playlistId = :localPlaylistId AND songId = :videoId")
++    suspend fun deletePairSongFromPlaylist(
++        localPlaylistId: Long,
++        videoId: String,
++    )
++
+     @Query("SELECT * FROM pair_song_local_playlist WHERE playlistId = :playlistId ORDER BY position ASC LIMIT :limit OFFSET :offset")
+     suspend fun getPlaylistPairSong(
+         playlistId: Long,
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/dataStore/DataStoreManagerImpl.kt b/data/src/commonMain/kotlin/com/maxrave/data/dataStore/DataStoreManagerImpl.kt
+index 9befde3..d6dde66 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/dataStore/DataStoreManagerImpl.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/dataStore/DataStoreManagerImpl.kt
+@@ -1524,6 +1524,32 @@ internal class DataStoreManagerImpl(
+         }
+     }
+ 
++    override val likedSortArtistRules: Flow<String?> =
++        settingsDataStore.data.map { preferences ->
++            preferences[LIKED_SORT_ARTIST_RULES]
++        }
++
++    override suspend fun setLikedSortArtistRules(rulesJson: String?) {
++        withContext(Dispatchers.IO) {
++            settingsDataStore.edit { settings ->
++                if (rulesJson == null) settings.remove(LIKED_SORT_ARTIST_RULES) else settings[LIKED_SORT_ARTIST_RULES] = rulesJson
++            }
++        }
++    }
++
++    override val likedSortSongOverrides: Flow<String?> =
++        settingsDataStore.data.map { preferences ->
++            preferences[LIKED_SORT_SONG_OVERRIDES]
++        }
++
++    override suspend fun setLikedSortSongOverrides(overridesJson: String?) {
++        withContext(Dispatchers.IO) {
++            settingsDataStore.edit { settings ->
++                if (overridesJson == null) settings.remove(LIKED_SORT_SONG_OVERRIDES) else settings[LIKED_SORT_SONG_OVERRIDES] = overridesJson
++            }
++        }
++    }
++
+     // Defaults to FALSE for the same reason as autoDownloadLikedSongs.
+     override val smartDownloadsEnabled: Flow<String> =
+         settingsDataStore.data.map { preferences ->
+@@ -1911,6 +1937,8 @@ internal class DataStoreManagerImpl(
+         val CROSSFADE_DJ_MODE = stringPreferencesKey("crossfade_dj_mode")
+         val CROSSFADE_SKIP_ALBUM = stringPreferencesKey("crossfade_skip_album")
+         val AUTO_DOWNLOAD_LIKED_SONGS = stringPreferencesKey("auto_download_liked_songs")
++        val LIKED_SORT_ARTIST_RULES = stringPreferencesKey("liked_sort_artist_rules")
++        val LIKED_SORT_SONG_OVERRIDES = stringPreferencesKey("liked_sort_song_overrides")
+         val SMART_DOWNLOADS_ENABLED = stringPreferencesKey("smart_downloads_enabled")
+         val SMART_DOWNLOADS_COUNT = intPreferencesKey("smart_downloads_count")
+         val SMART_DOWNLOADS_LAST_RUN = longPreferencesKey("smart_downloads_last_run")
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt b/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt
+index b7d7909..f088f7d 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/db/datasource/LocalDataSource.kt
+@@ -438,6 +438,8 @@ internal class LocalDataSource(
+ 
+     suspend fun getLocalPlaylist(id: Long) = databaseDao.getLocalPlaylist(id)
+ 
++    suspend fun getLocalPlaylistByTitle(title: String) = databaseDao.getLocalPlaylistByTitle(title)
++
+     // Every new playlist gets its library-sync identity at birth; see LocalPlaylistEntity.syncId.
+     suspend fun insertLocalPlaylist(localPlaylist: LocalPlaylistEntity): Long {
+         val id = databaseDao.insertLocalPlaylist(localPlaylist.withSyncId())
+@@ -569,6 +571,16 @@ internal class LocalDataSource(
+         youtubePlaylistId: String,
+     ) = databaseDao.deleteSetVideoId(videoId, youtubePlaylistId)
+ 
++    suspend fun findPlaylistPairOfSongNullable(
++        videoId: String,
++        localPlaylistId: Long,
++    ) = databaseDao.findPlaylistPairOfSongNullable(videoId, localPlaylistId)
++
++    suspend fun deletePairSongFromPlaylist(
++        localPlaylistId: Long,
++        videoId: String,
++    ) = databaseDao.deletePairSongFromPlaylist(localPlaylistId, videoId)
++
+     suspend fun insertPairSongLocalPlaylist(pairSongLocalPlaylist: PairSongLocalPlaylist) {
+         databaseDao.insertPairSongLocalPlaylist(pairSongLocalPlaylist)
+         syncRecorder.playlistTrack(pairSongLocalPlaylist.playlistId, pairSongLocalPlaylist.songId, inPlaylist = true)
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/di/RepositoryModule.kt b/data/src/commonMain/kotlin/com/maxrave/data/di/RepositoryModule.kt
+index 1fcea31..49c1806 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/di/RepositoryModule.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/di/RepositoryModule.kt
+@@ -89,7 +89,7 @@ val repositoryModule =
+         }
+ 
+         single<ImportRepository>(createdAtStart = true) {
+-            ImportRepositoryImpl(get())
++            ImportRepositoryImpl(get(), get())
+         }
+ 
+         single<LocalPlaylistRepository>(createdAtStart = true) {
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt b/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt
+index a674c50..ed35e5a 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/repository/ImportRepositoryImpl.kt
+@@ -10,6 +10,7 @@ import com.maxrave.domain.data.model.importdata.ImportPlaylist
+ import com.maxrave.domain.data.model.importdata.ImportResult
+ import com.maxrave.domain.data.model.importdata.ImportSong
+ import com.maxrave.domain.repository.ImportProgress
++import com.maxrave.domain.manager.DataStoreManager
+ import com.maxrave.domain.repository.ImportRepository
+ import com.maxrave.domain.utils.MusicVideoType
+ import com.maxrave.logger.Logger
+@@ -22,6 +23,7 @@ import kotlinx.datetime.TimeZone
+ import kotlinx.datetime.toLocalDateTime
+ import kotlin.time.Clock
+ import kotlin.time.Duration.Companion.seconds
++import kotlinx.serialization.encodeToString
+ import kotlinx.serialization.json.Json
+ 
+ private const val TAG = "ImportRepositoryImpl"
+@@ -36,6 +38,7 @@ private const val SONG_BATCH_SIZE = 500
+ 
+ internal class ImportRepositoryImpl(
+     private val localDataSource: LocalDataSource,
++    private val dataStoreManager: DataStoreManager,
+ ) : ImportRepository {
+     /**
+      * Same posture as the Room converters: unknown keys are dropped rather than rejected, so a file
+@@ -61,10 +64,21 @@ internal class ImportRepositoryImpl(
+                         return@flow
+                     }
+ 
++            // Personal bucket rules ride along with an import (a rules-only file is a valid way to
++            // deliver them). A file without them keeps what is already stored rather than wiping it.
++            runCatching {
++                if (data.artistRules.isNotEmpty()) {
++                    dataStoreManager.setLikedSortArtistRules(jsonFormat.encodeToString(data.artistRules))
++                }
++                if (data.songOverrides.isNotEmpty()) {
++                    dataStoreManager.setLikedSortSongOverrides(jsonFormat.encodeToString(data.songOverrides))
++                }
++            }.onFailure { Logger.e(TAG, "import: could not store liked-sort rules - ${it.message}") }
++
+             // A file that parses but carries nothing is almost always the wrong file: with unknown
+             // keys ignored, any JSON object decodes into an empty ImportData. Reporting that as an
+             // error beats reporting a successful import of zero songs.
+-            if (data.songs.isEmpty() && data.playlists.isEmpty()) {
++            if (data.songs.isEmpty() && data.playlists.isEmpty() && data.artistRules.isEmpty() && data.songOverrides.isEmpty()) {
+                 Logger.e(TAG, "import: file has no songs and no playlists")
+                 emit(ImportProgress.Error(invalidFileMessage))
+                 return@flow
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/repository/LikedSongSorter.kt b/data/src/commonMain/kotlin/com/maxrave/data/repository/LikedSongSorter.kt
+new file mode 100644
+index 0000000..524cc84
+--- /dev/null
++++ b/data/src/commonMain/kotlin/com/maxrave/data/repository/LikedSongSorter.kt
+@@ -0,0 +1,151 @@
++package com.maxrave.data.repository
++
++import com.maxrave.data.db.datasource.LocalDataSource
++import com.maxrave.domain.data.entities.LocalPlaylistEntity
++import com.maxrave.domain.data.entities.PairSongLocalPlaylist
++import com.maxrave.domain.data.entities.SongEntity
++import com.maxrave.domain.data.model.librarysort.LikedBucket
++import com.maxrave.domain.data.model.librarysort.LikedSortResult
++import com.maxrave.domain.data.model.librarysort.LikedSortRules
++import com.maxrave.domain.data.model.librarysort.LikedSongClassifier
++import kotlinx.serialization.json.Json
++
++/**
++ * Files liked songs into the three personal bucket playlists (Phonk / English / Hindi). The
++ * playlists are plain local playlists and are never pushed to YouTube; a song already sitting in
++ * any of the three is never re-added or moved, so the sort is safe to re-run.
++ */
++internal class LikedSongSorter(
++    private val localDataSource: LocalDataSource,
++    private val removeOnUnlike: Boolean = DEFAULT_REMOVE_ON_UNLIKE,
++    private val loadRules: suspend () -> LikedSortRules,
++) {
++    /** Sorts one freshly liked song. No-op when the song row is gone or already bucketed. */
++    suspend fun onLiked(videoId: String): LikedBucket? {
++        val song = localDataSource.getSong(videoId) ?: return null
++        val rules = loadRules()
++        val bucket = bucketFor(song, rules)
++        val playlistId = ensureBucketPlaylistId(bucket)?.first ?: return null
++        addToBucketPlaylist(playlistId, song.videoId)
++        return bucket
++    }
++
++    /** Pulls an unliked song back out of the buckets, only when removal on unlike is enabled. */
++    suspend fun onUnliked(videoId: String) {
++        if (!removeOnUnlike) return
++        for (bucket in LikedBucket.entries) {
++            val playlist = localDataSource.getLocalPlaylistByTitle(bucket.playlistTitle) ?: continue
++            localDataSource.findPlaylistPairOfSongNullable(videoId, playlist.id) ?: continue
++            localDataSource.deletePairSongFromPlaylist(playlist.id, videoId)
++            localDataSource.updateLocalPlaylistTracks(playlist.tracks.orEmpty() - videoId, playlist.id)
++        }
++    }
++
++    /** The one-time pass over the whole liked list, paged so a large library never loads at once. */
++    suspend fun sortAllLiked(): LikedSortResult {
++        val rules = loadRules()
++        val playlistIds = mutableMapOf<LikedBucket, Long>()
++        var playlistsCreated = 0
++        for (bucket in LikedBucket.entries) {
++            val (id, createdHere) = ensureBucketPlaylistId(bucket) ?: continue
++            playlistIds[bucket] = id
++            if (createdHere) playlistsCreated++
++        }
++        var songsAdded = 0
++        var alreadyInPlaylist = 0
++        var phonkAdded = 0
++        var englishAdded = 0
++        var hindiAdded = 0
++        var offset = 0
++        while (true) {
++            val songs = localDataSource.getLikedSongs(PAGE_SIZE, offset)
++            if (songs.isEmpty()) break
++            offset += songs.size
++            for (song in songs) {
++                if (playlistIds.values.any { localDataSource.findPlaylistPairOfSongNullable(song.videoId, it) != null }) {
++                    alreadyInPlaylist++
++                    continue
++                }
++                val bucket = bucketFor(song, rules)
++                val playlistId = playlistIds[bucket] ?: continue
++                if (addToBucketPlaylist(playlistId, song.videoId)) {
++                    songsAdded++
++                    when (bucket) {
++                        LikedBucket.PHONK -> phonkAdded++
++                        LikedBucket.ENGLISH -> englishAdded++
++                        LikedBucket.HINDI -> hindiAdded++
++                    }
++                }
++            }
++        }
++        return LikedSortResult(
++            playlistsCreated = playlistsCreated,
++            songsAdded = songsAdded,
++            alreadyInPlaylist = alreadyInPlaylist,
++            phonkAdded = phonkAdded,
++            englishAdded = englishAdded,
++            hindiAdded = hindiAdded,
++        )
++    }
++
++    private fun bucketFor(
++        song: SongEntity,
++        rules: LikedSortRules,
++    ): LikedBucket =
++        LikedSongClassifier.bucketFor(
++            videoId = song.videoId,
++            title = song.title,
++            albumName = song.albumName,
++            artistNames = song.artistName.orEmpty(),
++            rules = rules,
++        )
++
++    /** @return the playlist id and whether this call created it, or null when both failed. */
++    private suspend fun ensureBucketPlaylistId(bucket: LikedBucket): Pair<Long, Boolean>? {
++        localDataSource.getLocalPlaylistByTitle(bucket.playlistTitle)?.let { return it.id to false }
++        val newId =
++            localDataSource.insertLocalPlaylist(
++                LocalPlaylistEntity(title = bucket.playlistTitle, tracks = emptyList()),
++            )
++        if (newId != -1L) return newId to true
++        // IGNORE dropped the row (a same-title playlist raced in); re-read it.
++        return localDataSource.getLocalPlaylistByTitle(bucket.playlistTitle)?.let { it.id to false }
++    }
++
++    /** @return true when the song was appended, false when it was already there (or went missing). */
++    private suspend fun addToBucketPlaylist(
++        playlistId: Long,
++        videoId: String,
++    ): Boolean {
++        if (localDataSource.findPlaylistPairOfSongNullable(videoId, playlistId) != null) return false
++        val playlist = localDataSource.getLocalPlaylist(playlistId) ?: return false
++        val nextPosition = playlist.tracks?.size ?: 0
++        localDataSource.insertPairSongLocalPlaylist(
++            PairSongLocalPlaylist(
++                playlistId = playlistId,
++                songId = videoId,
++                position = nextPosition,
++            ),
++        )
++        localDataSource.updateLocalPlaylistTracks(playlist.tracks.orEmpty() + videoId, playlistId)
++        return true
++    }
++
++    companion object {
++        /**
++         * Whether unliking a song also pulls it out of the bucket playlists. Both directions stay
++         * implemented; the constant is the owner call and flips in one place.
++         */
++        const val DEFAULT_REMOVE_ON_UNLIKE = false
++
++        private const val PAGE_SIZE = 100
++    }
++}
++
++private val likedSortRulesJson = Json { ignoreUnknownKeys = true }
++
++/** Decodes one stored rules object; an unreadable or absent value means no rules. */
++internal fun decodeLikedSortRules(raw: String?): Map<String, String> =
++    raw
++        ?.let { runCatching { likedSortRulesJson.decodeFromString<Map<String, String>>(it) }.getOrNull() }
++        .orEmpty()
+diff --git a/data/src/commonMain/kotlin/com/maxrave/data/repository/SongRepositoryImpl.kt b/data/src/commonMain/kotlin/com/maxrave/data/repository/SongRepositoryImpl.kt
+index 172aef4..eccd934 100644
+--- a/data/src/commonMain/kotlin/com/maxrave/data/repository/SongRepositoryImpl.kt
++++ b/data/src/commonMain/kotlin/com/maxrave/data/repository/SongRepositoryImpl.kt
+@@ -11,6 +11,8 @@ import com.maxrave.data.mapping.toWatchEndpoint
+ import com.maxrave.domain.data.entities.QueueEntity
+ import com.maxrave.domain.data.entities.DownloadState
+ import com.maxrave.domain.data.entities.SongEntity
++import com.maxrave.domain.data.model.librarysort.LikedSortResult
++import com.maxrave.domain.data.model.librarysort.LikedSortRules
+ import com.maxrave.domain.data.entities.SongInfoEntity
+ import com.maxrave.domain.data.entities.analytics.query.SongPlaySample
+ import com.maxrave.domain.data.model.browse.album.Track
+@@ -63,6 +65,18 @@ internal class SongRepositoryImpl(
+     private val localDataSource: LocalDataSource,
+     private val youTube: YouTube,
+ ) : SongRepository {
++    private val likedSongSorter by lazy {
++        LikedSongSorter(localDataSource) {
++            LikedSortRules(
++                artistRules = decodeLikedSortRules(dataStoreManager.likedSortArtistRules.first()),
++                songOverrides = decodeLikedSortRules(dataStoreManager.likedSortSongOverrides.first()),
++            )
++        }
++    }
++
++    override suspend fun sortAllLikedSongsIntoBuckets(): LikedSortResult =
++        withContext(Dispatchers.IO) { likedSongSorter.sortAllLiked() }
++
+     override fun getAllSongs(limit: Int): Flow<List<SongEntity>> =
+         flow {
+             emit(localDataSource.getAllSongs(limit))
+@@ -341,6 +355,13 @@ internal class SongRepositoryImpl(
+         likeStatus: Int,
+     ) = withContext(Dispatchers.Main) {
+         localDataSource.updateLiked(likeStatus, videoId)
++        if (likeStatus == 1) {
++            runCatching { likedSongSorter.onLiked(videoId) }
++                .onFailure { Logger.w(TAG, "Bucket sort on like failed for $videoId: ${it.message}") }
++        } else {
++            runCatching { likedSongSorter.onUnliked(videoId) }
++                .onFailure { Logger.w(TAG, "Bucket removal on unlike failed for $videoId: ${it.message}") }
++        }
+         if (likeStatus == 1 && dataStoreManager.autoDownloadLikedSongs.first() == TRUE) {
+             val song = localDataSource.getSong(videoId)
+             if (song != null && song.downloadState != DownloadState.STATE_DOWNLOADED) {
+diff --git a/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt b/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt
+index 2595ab1..f80eea3 100644
+--- a/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt
++++ b/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt
+@@ -9,6 +9,7 @@ import com.maxrave.data.db.Converters
+ import com.maxrave.data.db.MusicDatabase
+ import com.maxrave.data.db.datasource.LocalDataSource
+ import com.maxrave.domain.data.entities.SongEntity
++import com.maxrave.domain.manager.DataStoreManager
+ import com.maxrave.domain.repository.ImportProgress
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.toList
+@@ -32,6 +33,26 @@ class ImportLikedRegressionTest {
+     private lateinit var db: MusicDatabase
+     private lateinit var dao: DatabaseDao
+     private lateinit var repo: ImportRepositoryImpl
++    private lateinit var sortRulesStore: MutableMap<String, String?>
++
++    /** Records the liked-sort rules the importer stores; every other call is unexpected here. */
++    private fun recordingDataStoreManager(store: MutableMap<String, String?>): DataStoreManager =
++        java.lang.reflect.Proxy.newProxyInstance(
++            DataStoreManager::class.java.classLoader,
++            arrayOf(DataStoreManager::class.java),
++        ) { _, method, args ->
++            when (method.name) {
++                "setLikedSortArtistRules" -> {
++                    store["artistRules"] = args?.get(0) as String?
++                    Unit
++                }
++                "setLikedSortSongOverrides" -> {
++                    store["songOverrides"] = args?.get(0) as String?
++                    Unit
++                }
++                else -> throw UnsupportedOperationException("unexpected call: ${method.name}")
++            }
++        } as DataStoreManager
+ 
+     @BeforeTest
+     fun setUp() {
+@@ -43,7 +64,8 @@ class ImportLikedRegressionTest {
+                 .setQueryCoroutineContext(Dispatchers.IO)
+                 .build()
+         dao = db.getDatabaseDao()
+-        repo = ImportRepositoryImpl(LocalDataSource(dao, db))
++        sortRulesStore = mutableMapOf()
++        repo = ImportRepositoryImpl(LocalDataSource(dao, db), recordingDataStoreManager(sortRulesStore))
+     }
+ 
+     @AfterTest
+@@ -176,4 +198,20 @@ class ImportLikedRegressionTest {
+             assertNull(dao.getSong("missing"))
+         }
+     }
++
++    @Test
++    fun rulesOnlyFileStoresRulesAndSucceeds() {
++        val json = """{"songs":[],"playlists":[],"artistRules":{"Akon":"english"},"songOverrides":{"v1":"phonk"}}"""
++        assertSuccess(run(json))
++        assertEquals("{\"Akon\":\"english\"}", sortRulesStore["artistRules"])
++        assertEquals("{\"v1\":\"phonk\"}", sortRulesStore["songOverrides"])
++    }
++
++    @Test
++    fun fileWithoutRulesLeavesStoredRulesUntouched() {
++        sortRulesStore["artistRules"] = "{\"Akon\":\"english\"}"
++        assertSuccess(run(pack(Triple("n1", true, 0))))
++        assertEquals("{\"Akon\":\"english\"}", sortRulesStore["artistRules"])
++        assertEquals(null, sortRulesStore["songOverrides"])
++    }
+ }
+diff --git a/data/src/jvmTest/kotlin/com/maxrave/data/repository/LikedSongClassifierTest.kt b/data/src/jvmTest/kotlin/com/maxrave/data/repository/LikedSongClassifierTest.kt
+new file mode 100644
+index 0000000..096f40f
+--- /dev/null
++++ b/data/src/jvmTest/kotlin/com/maxrave/data/repository/LikedSongClassifierTest.kt
+@@ -0,0 +1,70 @@
++package com.maxrave.data.repository
++
++import com.maxrave.domain.data.model.librarysort.LikedBucket
++import com.maxrave.domain.data.model.librarysort.LikedSortRules
++import com.maxrave.domain.data.model.librarysort.LikedSongClassifier
++import kotlin.test.Test
++import kotlin.test.assertEquals
++
++/**
++ * Pure classifier tests - no database. The contract being pinned: overrides win, artist rules
++ * beat title tokens, word-boundary phonk tokens only fire on self-labelling titles, and anything
++ * unresolved falls through to Hindi.
++ */
++class LikedSongClassifierTest {
++    private fun classify(
++        videoId: String = "v1",
++        title: String,
++        albumName: String? = null,
++        artists: List<String> = emptyList(),
++        rules: LikedSortRules = LikedSortRules(),
++    ) = LikedSongClassifier.bucketFor(videoId, title, albumName, artists, rules)
++
++    @Test
++    fun songOverrideWinsOverArtistAndToken() {
++        val rules =
++            LikedSortRules(
++                artistRules = mapOf("Akon" to "english"),
++                songOverrides = mapOf("v1" to "phonk"),
++            )
++        assertEquals(LikedBucket.PHONK, classify(title = "ordinary", artists = listOf("Akon"), rules = rules))
++    }
++
++    @Test
++    fun artistRuleBeatsPhonkTokenInTitle() {
++        val rules = LikedSortRules(artistRules = mapOf("Mark Ronson" to "english"))
++        assertEquals(LikedBucket.ENGLISH, classify(title = "Uptown Funk", artists = listOf("Mark Ronson"), rules = rules))
++    }
++
++    @Test
++    fun firstCreditedArtistWithARuleDecides() {
++        val rules = LikedSortRules(artistRules = mapOf("Vishal-Shekhar" to "hindi", "Akon" to "english"))
++        assertEquals(
++            LikedBucket.HINDI,
++            classify(title = "Chammak Challo", artists = listOf("Vishal-Shekhar", "Akon", "Hamsika Iyer"), rules = rules),
++        )
++    }
++
++    @Test
++    fun unknownArtistWithPhonkTokenGoesPhonk() {
++        assertEquals(LikedBucket.PHONK, classify(title = "MONTAGEM X", artists = listOf("DJ Unknown")))
++        assertEquals(LikedBucket.PHONK, classify(title = "Slide da Treme Melódica v2", albumName = "Funk Automotivo"))
++    }
++
++    @Test
++    fun wordBoundariesKeepFunkytownOutOfPhonk() {
++        assertEquals(LikedBucket.HINDI, classify(title = "Funkytown", artists = listOf("Lipps Inc.")))
++    }
++
++    @Test
++    fun unknownEverythingFallsThroughToHindi() {
++        assertEquals(LikedBucket.HINDI, classify(title = "Aankhein Khuli", artists = listOf("Lata Mangeshkar")))
++        assertEquals(LikedBucket.HINDI, classify(title = "Gasolina", artists = listOf("Daddy Yankee")))
++    }
++
++    @Test
++    fun unrecognizedRuleValuesAreIgnored() {
++        val rules = LikedSortRules(artistRules = mapOf("BTS" to "kpop"), songOverrides = mapOf("v1" to "lofi"))
++        assertEquals(LikedBucket.HINDI, classify(title = "Dynamite", artists = listOf("BTS"), rules = rules))
++    }
++}
+diff --git a/data/src/jvmTest/kotlin/com/maxrave/data/repository/LikedSongSorterTest.kt b/data/src/jvmTest/kotlin/com/maxrave/data/repository/LikedSongSorterTest.kt
+new file mode 100644
+index 0000000..08adf93
+--- /dev/null
++++ b/data/src/jvmTest/kotlin/com/maxrave/data/repository/LikedSongSorterTest.kt
+@@ -0,0 +1,183 @@
++package com.maxrave.data.repository
++
++import DatabaseDao
++import androidx.room.Room
++import androidx.sqlite.driver.bundled.BundledSQLiteDriver
++import com.maxrave.data.db.Converters
++import com.maxrave.data.db.MusicDatabase
++import com.maxrave.data.db.datasource.LocalDataSource
++import com.maxrave.domain.data.entities.SongEntity
++import com.maxrave.domain.data.model.librarysort.LikedBucket
++import com.maxrave.domain.data.model.librarysort.LikedSortRules
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.runBlocking
++import kotlinx.datetime.LocalDateTime
++import kotlin.test.AfterTest
++import kotlin.test.BeforeTest
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * Sorter tests against the real Room DAO and the real [MusicDatabase] schema on an in-memory
++ * SQLite database (bundled driver, desktop JVM). Nothing is mocked; Android itself is not
++ * exercised. Mirrors [ImportLikedRegressionTest]'s setup, including the sync dependency the
++ * 2.6.0 [LocalDataSource] constructor takes.
++ */
++class LikedSongSorterTest {
++    private lateinit var db: MusicDatabase
++    private lateinit var dao: DatabaseDao
++    private lateinit var dataSource: LocalDataSource
++
++    @BeforeTest
++    fun setUp() {
++        db =
++            Room
++                .inMemoryDatabaseBuilder<MusicDatabase>()
++                .addTypeConverter(Converters())
++                .setDriver(BundledSQLiteDriver())
++                .setQueryCoroutineContext(Dispatchers.IO)
++                .build()
++        dao = db.getDatabaseDao()
++        dataSource =
++            LocalDataSource(
++                dao,
++                db,
++                com.maxrave.data.librarysync.SyncChangeRecorder(
++                    db.getSyncDao(),
++                    com.maxrave.data.librarysync.SyncPrefs(
++                        object : androidx.datastore.core.DataStore<androidx.datastore.preferences.core.Preferences> {
++                            private val state =
++                                kotlinx.coroutines.flow.MutableStateFlow(
++                                    androidx.datastore.preferences.core.emptyPreferences(),
++                                )
++                            override val data: kotlinx.coroutines.flow.Flow<androidx.datastore.preferences.core.Preferences> = state
++
++                            override suspend fun updateData(
++                                transform: suspend (androidx.datastore.preferences.core.Preferences) -> androidx.datastore.preferences.core.Preferences,
++                            ): androidx.datastore.preferences.core.Preferences {
++                                val updated = transform(state.value)
++                                state.value = updated
++                                return updated
++                            }
++                        },
++                    ),
++                ),
++            )
++    }
++
++    @AfterTest
++    fun tearDown() {
++        db.close()
++    }
++
++    private fun song(
++        id: String,
++        title: String,
++        artist: String,
++        liked: Boolean = true,
++    ) = SongEntity(
++        videoId = id,
++        duration = "3:00",
++        durationSeconds = 180,
++        isAvailable = true,
++        isExplicit = false,
++        likeStatus = "",
++        title = title,
++        videoType = "",
++        category = null,
++        resultType = null,
++        liked = liked,
++        totalPlayTime = 0,
++        favoriteAt = LocalDateTime(2026, 1, 1, 0, 0),
++        artistName = listOf(artist),
++    )
++
++    private fun sorter(
++        rules: LikedSortRules = LikedSortRules(),
++        removeOnUnlike: Boolean = false,
++    ) = LikedSongSorter(dataSource, removeOnUnlike = removeOnUnlike) { rules }
++
++    private fun tracksOf(title: String): List<String> =
++        runBlocking { dao.getLocalPlaylistByTitle(title)?.tracks.orEmpty() }
++
++    @Test
++    fun firstPassCreatesThreePlaylistsAndFilesEveryLikedSong() {
++        val rules = LikedSortRules(artistRules = mapOf("Akon" to "english"))
++        runBlocking {
++            dao.insertSong(song("p1", "MONTAGEM X", "DJ X"))
++            dao.insertSong(song("e1", "Lonely", "Akon"))
++            dao.insertSong(song("h1", "Aankhein Khuli", "Lata Mangeshkar"))
++            dao.insertSong(song("u1", "Not Liked", "Akon", liked = false))
++
++            val result = sorter(rules).sortAllLiked()
++
++            assertEquals(3, result.playlistsCreated)
++            assertEquals(3, result.songsAdded)
++            assertEquals(0, result.alreadyInPlaylist)
++            assertEquals(1, result.phonkAdded)
++            assertEquals(1, result.englishAdded)
++            assertEquals(1, result.hindiAdded)
++            assertEquals(listOf("p1"), tracksOf("Phonk"))
++            assertEquals(listOf("e1"), tracksOf("English"))
++            assertEquals(listOf("h1"), tracksOf("Hindi"))
++            // The unliked song is untouched, and the sort never flips liked flags.
++            assertTrue(dao.getSong("p1")!!.liked)
++            assertTrue(tracksOf("English").none { it == "u1" })
++        }
++    }
++
++    @Test
++    fun secondPassIsIdempotentNoDuplicatePairsOrTracks() {
++        runBlocking {
++            dao.insertSong(song("e1", "Lonely", "Akon"))
++            val s = sorter(LikedSortRules(artistRules = mapOf("Akon" to "english")))
++            s.sortAllLiked()
++
++            val second = s.sortAllLiked()
++
++            assertEquals(0, second.playlistsCreated)
++            assertEquals(0, second.songsAdded)
++            assertEquals(1, second.alreadyInPlaylist)
++            assertEquals(listOf("e1"), tracksOf("English"))
++            val playlistId = dao.getLocalPlaylistByTitle("English")!!.id
++            assertNotNull(dao.findPlaylistPairOfSongNullable("e1", playlistId))
++        }
++    }
++
++    @Test
++    fun onLikedFilesTheNewSongIntoItsBucket() {
++        runBlocking {
++            dao.insertSong(song("e1", "Lonely", "Akon"))
++            val s = sorter(LikedSortRules(artistRules = mapOf("Akon" to "english")))
++            s.sortAllLiked()
++            dao.insertSong(song("e2", "Smack That", "Akon"))
++
++            val bucket = s.onLiked("e2")
++
++            assertEquals(LikedBucket.ENGLISH, bucket)
++            assertEquals(listOf("e1", "e2"), tracksOf("English"))
++        }
++    }
++
++    @Test
++    fun onUnlikedRemovesOnlyWhenRemovalIsEnabled() {
++        runBlocking {
++            dao.insertSong(song("e1", "Lonely", "Akon"))
++            val rules = LikedSortRules(artistRules = mapOf("Akon" to "english"))
++            val keeping = sorter(rules, removeOnUnlike = false)
++            keeping.sortAllLiked()
++
++            keeping.onUnliked("e1")
++            assertEquals(listOf("e1"), tracksOf("English"))
++
++            val removing = sorter(rules, removeOnUnlike = true)
++            removing.onUnliked("e1")
++            assertEquals(emptyList(), tracksOf("English"))
++            val playlistId = dao.getLocalPlaylistByTitle("English")!!.id
++            assertNull(dao.findPlaylistPairOfSongNullable("e1", playlistId))
++        }
++    }
++}
+diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt
+index bb8456b..4eb2f8f 100644
+--- a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt
++++ b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/importdata/ImportData.kt
+@@ -15,6 +15,14 @@ import kotlinx.serialization.Serializable
+ data class ImportData(
+     val songs: List<ImportSong> = emptyList(),
+     val playlists: List<ImportPlaylist> = emptyList(),
++    /**
++     * Personal liked-songs sorting rules (never part of the public converter format): an exact
++     * artist name to a bucket ("phonk", "english" or "hindi"). Stored on the device at import
++     * time; a file without them leaves the stored rules untouched.
++     */
++    val artistRules: Map<String, String> = emptyMap(),
++    /** videoId to bucket; wins over every other sorting signal. */
++    val songOverrides: Map<String, String> = emptyMap(),
+ )
+ 
+ /**
+diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/librarysort/LikedSort.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/librarysort/LikedSort.kt
+new file mode 100644
+index 0000000..0641b73
+--- /dev/null
++++ b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/librarysort/LikedSort.kt
+@@ -0,0 +1,70 @@
++package com.maxrave.domain.data.model.librarysort
++
++/**
++ * The three fixed personal playlists a liked song is filed into. The taxonomy is exact: phonk
++ * goes to Phonk, English goes to English, and every other language goes to Hindi - there is no
++ * fourth bucket.
++ */
++enum class LikedBucket(
++    val playlistTitle: String,
++    val ruleName: String,
++) {
++    PHONK("Phonk", "phonk"),
++    ENGLISH("English", "english"),
++    HINDI("Hindi", "hindi"),
++    ;
++
++    companion object {
++        fun fromRuleName(name: String?): LikedBucket? =
++            when (name?.trim()?.lowercase()) {
++                PHONK.ruleName -> PHONK
++                ENGLISH.ruleName -> ENGLISH
++                HINDI.ruleName -> HINDI
++                else -> null
++            }
++    }
++}
++
++/** What one one-time sort pass did, reported to the user when it finishes. */
++data class LikedSortResult(
++    val playlistsCreated: Int,
++    val songsAdded: Int,
++    val alreadyInPlaylist: Int,
++    val phonkAdded: Int,
++    val englishAdded: Int,
++    val hindiAdded: Int,
++)
++
++/** Private per-song and per-artist bucket rules, carried in from the import file. */
++data class LikedSortRules(
++    val artistRules: Map<String, String> = emptyMap(),
++    val songOverrides: Map<String, String> = emptyMap(),
++)
++
++/**
++ * Rule-based bucket assignment for one song.
++ *
++ * The app stores no genre or language metadata, so this is a heuristic, not the truth about a
++ * song. Per-song overrides win, then the artist table (the first credited artist with a rule
++ * decides), then self-labelling phonk tokens in the title/album, and everything else falls
++ * through to Hindi per the taxonomy. Word boundaries keep "Funkytown" out of Phonk.
++ */
++object LikedSongClassifier {
++    private val PHONK_TOKEN =
++        Regex("\\b(montagem|phonk|funk|batid[aã]o|automotivo)\\b", RegexOption.IGNORE_CASE)
++
++    fun bucketFor(
++        videoId: String,
++        title: String,
++        albumName: String?,
++        artistNames: List<String>,
++        rules: LikedSortRules,
++    ): LikedBucket {
++        LikedBucket.fromRuleName(rules.songOverrides[videoId])?.let { return it }
++        for (artist in artistNames) {
++            LikedBucket.fromRuleName(rules.artistRules[artist])?.let { return it }
++        }
++        if (PHONK_TOKEN.containsMatchIn(title) || PHONK_TOKEN.containsMatchIn(albumName.orEmpty())) return PHONK
++        return HINDI
++    }
++}
+diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/manager/DataStoreManager.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/manager/DataStoreManager.kt
+index 571d943..e83db22 100644
+--- a/domain/src/commonMain/kotlin/com/maxrave/domain/manager/DataStoreManager.kt
++++ b/domain/src/commonMain/kotlin/com/maxrave/domain/manager/DataStoreManager.kt
+@@ -480,6 +480,18 @@ interface DataStoreManager {
+ 
+     suspend fun setAutoDownloadLikedSongs(enabled: Boolean)
+ 
++    /**
++     * Personal liked-songs sorting rules as raw JSON objects (artist name or videoId to bucket),
++     * written by the import path and read by the liked-songs sorter. Null means no rules stored.
++     */
++    val likedSortArtistRules: Flow<String?>
++
++    suspend fun setLikedSortArtistRules(rulesJson: String?)
++
++    val likedSortSongOverrides: Flow<String?>
++
++    suspend fun setLikedSortSongOverrides(overridesJson: String?)
++
+     /**
+      * Smart downloads (Android only) keep the songs played most, scored from local tracking,
+      * downloaded, and refresh them at most once a day when the app opens on an unmetered network.
+diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/repository/SongRepository.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/repository/SongRepository.kt
+index e1ad385..8f58ee5 100644
+--- a/domain/src/commonMain/kotlin/com/maxrave/domain/repository/SongRepository.kt
++++ b/domain/src/commonMain/kotlin/com/maxrave/domain/repository/SongRepository.kt
+@@ -1,5 +1,7 @@
+ package com.maxrave.domain.repository
+ 
++import com.maxrave.domain.data.model.librarysort.LikedSortResult
++
+ import com.maxrave.domain.data.entities.QueueEntity
+ import com.maxrave.domain.data.entities.SongEntity
+ import com.maxrave.domain.data.entities.SongInfoEntity
+@@ -102,6 +104,13 @@ interface SongRepository {
+         likeStatus: Int,
+     )
+ 
++    /**
++     * One-time pass filing every liked song into the three personal bucket playlists
++     * (Phonk / English / Hindi). Songs already sitting in any of them are left in place, so a
++     * re-run only picks up what is new. Liked flags are never touched.
++     */
++    suspend fun sortAllLikedSongsIntoBuckets(): LikedSortResult
++
+     fun updateSongInLibrary(
+         inLibrary: LocalDateTime,
+         videoId: String,
