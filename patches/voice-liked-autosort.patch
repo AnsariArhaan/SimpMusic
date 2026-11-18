@@ -178,10 +178,10 @@ index a674c50..ed35e5a 100644
                  return@flow
 diff --git a/data/src/commonMain/kotlin/com/maxrave/data/repository/LikedSongSorter.kt b/data/src/commonMain/kotlin/com/maxrave/data/repository/LikedSongSorter.kt
 new file mode 100644
-index 0000000..524cc84
+index 0000000..d10c5f1
 --- /dev/null
 +++ b/data/src/commonMain/kotlin/com/maxrave/data/repository/LikedSongSorter.kt
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,153 @@
 +package com.maxrave.data.repository
 +
 +import com.maxrave.data.db.datasource.LocalDataSource
@@ -317,10 +317,12 @@ index 0000000..524cc84
 +
 +    companion object {
 +        /**
-+         * Whether unliking a song also pulls it out of the bucket playlists. Both directions stay
-+         * implemented; the constant is the owner call and flips in one place.
++         * Whether unliking a song also pulls it out of the three managed bucket playlists
++         * (manual playlists, downloads and song rows are untouched). Both directions stay
++         * implemented; the constant is the owner call and flips in one place. Owner answer:
++         * removal ON (confirmed Nov 19, 2026).
 +         */
-+        const val DEFAULT_REMOVE_ON_UNLIKE = false
++        const val DEFAULT_REMOVE_ON_UNLIKE = true
 +
 +        private const val PAGE_SIZE = 100
 +    }

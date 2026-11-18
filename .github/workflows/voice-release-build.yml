@@ -21,10 +21,10 @@ jobs:
     env:
       VARIANT: ${{ matrix.variant }}
     steps:
-      - name: Check out exact delivered voice18 source
+      - name: Check out the dispatched commit (voice18 source tree + patch set)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: f3ddfa2a75b12252280e731aa68d98e214bfd085
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Prepare pinned official update and personal variant
         shell: bash
