@@ -31,8 +31,17 @@ def say(msg):
     print(msg, flush=True)
     LOG.write(msg + "\n"); LOG.flush()
 
+def ensure_device():
+    if sh("adb get-state 2>/dev/null").strip() != "device":
+        say("device lost; waiting up to 60s for recovery")
+        sh("adb wait-for-device", timeout=70)
+        time.sleep(5)
+        if sh("adb get-state 2>/dev/null").strip() != "device":
+            raise RuntimeError("emulator device lost and did not recover")
+
 def stage(name, fn, gating=False):
     try:
+        ensure_device()
         fn()
         RESULTS.append((name, "PASS")); say("STAGE %s: PASS" % name)
     except StageBlocked as e:
@@ -128,7 +137,7 @@ def swipe(times=1):
     w, h = screen_size()
     x = w // 2
     for _ in range(times):
-        sh("adb shell input swipe %d %d %d %d" % (x, int(h*0.75), x, int(h*0.25)))
+        sh("adb shell input swipe %d %d %d %d 400" % (x, int(h*0.75), x, int(h*0.25)))
         time.sleep(1.5)
 
 def back(): sh("adb shell input keyevent KEYCODE_BACK"); time.sleep(2)
@@ -147,7 +156,7 @@ def launch():
             return
     raise RuntimeError("app process never started")
 
-DIALOG_OK = ["ALLOW", "Allow", "While using the app", "WHILE USING THE APP", "Yes", "Confirm", "Next", "Done", "Get started", "Agree", "Continue", "Skip", "Got it", "OK"]
+DIALOG_OK = ["Cancel", "ALLOW", "Allow", "While using the app", "WHILE USING THE APP", "Yes", "Confirm", "Next", "Done", "Get started", "Agree", "Continue", "Skip", "Got it", "OK"]
 def dismiss_first_run():
     for _ in range(6):
         parse(dump("first-run"))
