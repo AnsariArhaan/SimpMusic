@@ -1,11 +1,12 @@
 name: TEMP render smoke check (sort update UI proof)
 
 on:
-  workflow_dispatch:
-    inputs:
-      run_id:
-        description: 'Build run id whose simpmusic-260-sort artifact holds the APK'
-        required: true
+  push:
+    branches: [arhaan/liked-autosort]
+    paths:
+      - '.github/workflows/render-smoke.yml'
+      - 'ci/render_smoke.py'
+      - 'ci/smoke-run-id.txt'
 
 permissions:
   contents: read
@@ -24,11 +25,14 @@ jobs:
           java-version: 21
           distribution: microsoft
 
+      - name: Read target build run id
+        run: echo "SORT_RUN_ID=$(cat ci/smoke-run-id.txt)" >> "$GITHUB_ENV"
+
       - name: Download the verified sort APK artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: simpmusic-260-sort
-          run-id: ${{ inputs.run_id }}
+          run-id: ${{ env.SORT_RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: apk
 
