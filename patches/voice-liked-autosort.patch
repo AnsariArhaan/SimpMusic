@@ -737,7 +737,7 @@ index bb8456b..4eb2f8f 100644
  /**
 diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/librarysort/LikedSort.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/librarysort/LikedSort.kt
 new file mode 100644
-index 0000000..0641b73
+index 0000000..4da8f52
 --- /dev/null
 +++ b/domain/src/commonMain/kotlin/com/maxrave/domain/data/model/librarysort/LikedSort.kt
 @@ -0,0 +1,70 @@
@@ -807,8 +807,8 @@ index 0000000..0641b73
 +        for (artist in artistNames) {
 +            LikedBucket.fromRuleName(rules.artistRules[artist])?.let { return it }
 +        }
-+        if (PHONK_TOKEN.containsMatchIn(title) || PHONK_TOKEN.containsMatchIn(albumName.orEmpty())) return PHONK
-+        return HINDI
++        if (PHONK_TOKEN.containsMatchIn(title) || PHONK_TOKEN.containsMatchIn(albumName.orEmpty())) return LikedBucket.PHONK
++        return LikedBucket.HINDI
 +    }
 +}
 diff --git a/domain/src/commonMain/kotlin/com/maxrave/domain/manager/DataStoreManager.kt b/domain/src/commonMain/kotlin/com/maxrave/domain/manager/DataStoreManager.kt
