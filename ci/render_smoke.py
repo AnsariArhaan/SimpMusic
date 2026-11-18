@@ -114,9 +114,22 @@ def wait_for(targets, timeout=30, tag=""):
         time.sleep(3)
     return False
 
+_SCR = None
+def screen_size():
+    global _SCR
+    if _SCR is None:
+        out = sh("adb shell wm size")
+        m = re.search(r"(\d+)x(\d+)", out)
+        _SCR = (int(m.group(1)), int(m.group(2))) if m else (1080, 2400)
+        say("screen size: %s" % (_SCR,))
+    return _SCR
+
 def swipe(times=1):
+    w, h = screen_size()
+    x = w // 2
     for _ in range(times):
-        sh("adb shell input swipe 540 1700 540 500"); time.sleep(1.5)
+        sh("adb shell input swipe %d %d %d %d" % (x, int(h*0.75), x, int(h*0.25)))
+        time.sleep(1.5)
 
 def back(): sh("adb shell input keyevent KEYCODE_BACK"); time.sleep(2)
 
@@ -134,12 +147,13 @@ def launch():
             return
     raise RuntimeError("app process never started")
 
+DIALOG_OK = ["ALLOW", "Allow", "While using the app", "WHILE USING THE APP", "Yes", "Confirm", "Next", "Done", "Get started", "Agree", "Continue", "Skip", "Got it", "OK"]
 def dismiss_first_run():
-    for _ in range(4):
+    for _ in range(6):
         parse(dump("first-run"))
-        n = find(["Confirm", "Next", "Done", "Get started", "Agree", "Continue", "Skip"])
+        n = find(DIALOG_OK)
         if not n: return
-        tap_node(n, "dismiss-first-run")
+        tap_node(n, "dismiss-dialog")
 
 def logcat_tail():
     out = sh("adb logcat -d -t 400 2>/dev/null")
@@ -184,26 +198,47 @@ def s0_old_install_and_seed():
     tap_node(e, "name-field"); type_text("KeepMe")
     tap_text(["Save", "Create", "OK", "Done"], required=False, tag="old-save")
     shot("S0-old-keepme")
-    if not wait_for(["KeepMe"], timeout=15, tag="old-keepme"):
+    global S0_SEEDED
+    S0_SEEDED = wait_for(["KeepMe"], timeout=15, tag="old-keepme")
+    if not S0_SEEDED:
         raise RuntimeError("KeepMe not visible after creation in old app")
+
+S0_SEEDED = False
 
 def s1_upgrade():
     sh("adb install -r %s" % apk_from("apk"), check=True)
     launch(); dismiss_first_run(); shot("S1-home-after-upgrade")
+    dismiss_first_run()
+    if not sh("adb shell pidof %s" % PKG).strip():
+        raise RuntimeError("app process not running after upgrade install")
+
+def s1r_retention():
+    if not S0_SEEDED:
+        raise StageBlocked("S0 seeding did not complete, retention not provable this run")
+    dismiss_first_run()
     tap_text(["Library"], tag="new-library")
     time.sleep(3)
     if not wait_for(["KeepMe"], timeout=20, tag="keepme-retained"):
-        shot("S1-library-missing-keepme")
+        shot("S1R-library-missing-keepme")
         raise RuntimeError("KeepMe playlist lost across upgrade")
+
+def scroll_until(targets, max_swipes=12, tag="scroll"):
+    last = None
+    for i in range(max_swipes):
+        xml = dump("%s-%d" % (tag, i))
+        parse(xml)
+        if find(targets): return True
+        if xml == last:
+            say("scroll stuck (no content change) at swipe %d" % i)
+            return False
+        last = xml
+        swipe()
+    return False
 
 def s2_button_present():
     go_settings()
     shot("S2-settings")
-    found = False
-    for _ in range(8):
-        parse(dump("S2-scroll"))
-        if find(["Sort liked songs"]): found = True; break
-        swipe()
+    found = scroll_until(["Sort liked songs"], tag="S2-scroll")
     shot("S2-sort-button")
     if not found: raise RuntimeError("Sort liked songs row not found in Settings")
 
@@ -216,10 +251,8 @@ def s3_import_rules():
     sh("adb push /tmp/smoke-rules.json /sdcard/Download/smoke-rules.json", check=True)
     sh("adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/smoke-rules.json >/dev/null 2>&1")
     go_settings()
-    for _ in range(8):
-        parse(dump("S3-scroll"))
-        if find(["Import data"]): break
-        swipe()
+    if not scroll_until(["Import data"], tag="S3-scroll"):
+        raise RuntimeError("Import data row not found in Settings")
     tap_text(["Import data"], tag="import-data")
     time.sleep(4)  # SAF picker
     shot("S3-saf-open")
@@ -245,10 +278,8 @@ def s3_import_rules():
 
 def s4_sort_zero_likes():
     go_settings()
-    for _ in range(8):
-        parse(dump("S4-scroll"))
-        if find(["Sort liked songs"]): break
-        swipe()
+    if not scroll_until(["Sort liked songs"], tag="S4-scroll"):
+        raise RuntimeError("Sort liked songs row not found for tap")
     tap_text(["Sort liked songs"], tag="sort-tap")
     time.sleep(4)
     shot("S4-after-sort-tap")
@@ -335,6 +366,7 @@ def main():
     say("smoke start %s" % time.strftime("%H:%M:%S"))
     stage("S0-old-install-seed", s0_old_install_and_seed)
     stage("S1-upgrade-install", s1_upgrade, gating=True)
+    stage("S1R-keepme-retained", s1r_retention)
     stage("S2-sort-button", s2_button_present, gating=True)
     stage("S3-rules-import", s3_import_rules, gating=True)
     stage("S4-sort-zero-likes", s4_sort_zero_likes)
