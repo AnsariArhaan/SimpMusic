@@ -13,7 +13,7 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Check out this branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -32,21 +32,30 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: apk
 
+      - name: Download the prior voice67 APK artifact (upgrade source)
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: simpmusic-260-voice
+          run-id: 43935539163
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: apk-old
+
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Install, launch, navigate Settings > Backup, screenshot
+      - name: Staged installed-app smoke check on emulator
         uses: reactivecircus/android-emulator-runner@4c44018e59b437e86cdfc41da381398f93ed8808 # v2
         with:
           api-level: 34
           target: default
           arch: x86_64
-          script: bash ci/render-smoke.sh
+          script: python3 ci/render_smoke.py
 
-      - name: Upload screenshots
+      - name: Upload screenshots and stage report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
