@@ -56,7 +56,7 @@ jobs:
         with:
           api-level: 34
           target: default
-          arch: x86_64
+          arch: arm64-v8a
           script: python3 ci/render_smoke.py
 
       - name: Upload screenshots and stage report

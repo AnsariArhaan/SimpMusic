@@ -126,7 +126,13 @@ def type_text(s):
 
 def launch():
     sh("adb shell monkey -p %s -c android.intent.category.LAUNCHER 1 >/dev/null" % PKG)
-    time.sleep(20)
+    end = time.time() + 150
+    while time.time() < end:
+        time.sleep(5)
+        if sh("adb shell pidof %s" % PKG).strip():
+            time.sleep(15)  # let first frame render
+            return
+    raise RuntimeError("app process never started")
 
 def dismiss_first_run():
     for _ in range(4):
@@ -143,9 +149,12 @@ def logcat_tail():
             raise RuntimeError("app crash seen in logcat")
 
 def apk_from(d):
-    hits = sorted(glob.glob(os.path.join(d, "**", "*x86_64*.apk"), recursive=True))
-    if not hits: raise StageBlocked("no x86_64 apk in %s" % d)
-    return hits[0]
+    hits = sorted(glob.glob(os.path.join(d, "**", "*.apk"), recursive=True))
+    if not hits: raise StageBlocked("no apk in %s" % d)
+    x86 = [h for h in hits if "x86_64" in h]
+    pick = x86[0] if x86 else hits[0]
+    say("using apk: %s" % pick)
+    return pick
 
 def go_settings():
     launch(); dismiss_first_run()
@@ -336,7 +345,7 @@ def main():
     for n, r in RESULTS: say("%-22s %s" % (n, r))
     LOG.close()
     critical = {"S1-upgrade-install", "S2-sort-button", "S3-rules-import"}
-    bad = [n for n, r in RESULTS if n.split("-")[0] in critical and not r.startswith("PASS")]
+    bad = [n for n, r in RESULTS if n in critical and not r.startswith("PASS")]
     sys.exit(1 if bad else 0)
 
 main()
