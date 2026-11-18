@@ -7,6 +7,7 @@ on:
       - '.github/workflows/render-smoke.yml'
       - 'ci/render_smoke.py'
       - 'ci/smoke-run-id.txt'
+      - 'ci/smoke-old-run-id.txt'
 
 permissions:
   contents: read
@@ -25,8 +26,10 @@ jobs:
           java-version: 21
           distribution: microsoft
 
-      - name: Read target build run id
-        run: echo "SORT_RUN_ID=$(cat ci/smoke-run-id.txt)" >> "$GITHUB_ENV"
+      - name: Read target build run ids
+        run: |
+          echo "SORT_RUN_ID=$(cat ci/smoke-run-id.txt)" >> "$GITHUB_ENV"
+          echo "OLD_RUN_ID=$(cat ci/smoke-old-run-id.txt)" >> "$GITHUB_ENV"
 
       - name: Download the verified sort APK artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -41,7 +44,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: simpmusic-260-voice
-          run-id: 43935539163
+          run-id: ${{ env.OLD_RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: apk-old
 
@@ -56,7 +59,7 @@ jobs:
         with:
           api-level: 34
           target: default
-          arch: arm64-v8a
+          arch: x86_64
           script: python3 ci/render_smoke.py
 
       - name: Upload screenshots and stage report

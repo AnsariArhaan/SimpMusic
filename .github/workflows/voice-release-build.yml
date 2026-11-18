@@ -326,6 +326,8 @@ jobs:
           mkdir -p deliver
           OUT="deliver/SimpMusic-2.6.0-${VARIANT}-arm64.apk"
           cp "$APK" "$OUT"
+          X86=$(find prepared/androidApp/build/outputs/apk -name '*x86_64*.apk' | head -1)
+          if [ -n "$X86" ]; then cp "$X86" "deliver/SimpMusic-2.6.0-${VARIANT}-x86_64-emulator-only.apk"; fi
           "$BT/aapt" dump badging "$OUT" | tee deliver/identity.txt
           grep -q "package: name='com.maxrave.simpmusic.dev'" deliver/identity.txt
           if grep -q 'application-debuggable' deliver/identity.txt; then exit 1; fi
