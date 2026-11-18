@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: ${{ fromJSON(inputs.variant == 'voice' && '["voice"]' || inputs.variant == 'base' && '["base"]' || inputs.variant == 'sort' && '["sort"]' || '["base","voice"]') }}
+        variant: ${{ fromJSON(inputs.variant == 'voice' && '["voice"]' || inputs.variant == 'base' && '["base"]' || inputs.variant == 'sort' && '["sort"]' || inputs.variant == 'voicesort' && '["voicesort"]' || '["base","voice"]') }}
     env:
       VARIANT: ${{ matrix.variant }}
     steps:
@@ -32,7 +32,7 @@ jobs:
           cat > "$RUNNER_TEMP/prepare-update.py" <<'PY'
           import pathlib, subprocess, re, os, json
           root=pathlib.Path(os.environ['GITHUB_WORKSPACE']); out=root/'prepared'; variant=os.environ['VARIANT']
-          assert variant in ['base','voice','sort']
+          assert variant in ['base','voice','sort','voicesort']
           out.mkdir(exist_ok=True)
           subprocess.run(['git','fetch','--no-tags','https://github.com/maxrave-dev/SimpMusic.git','140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05'],check=True)
           with subprocess.Popen(['git','archive','140673ab2f2b83d5a2264d3a5f51f1dce3ab6b05'],stdout=subprocess.PIPE) as p:
@@ -53,14 +53,14 @@ jobs:
           '''+anchor)
           s=s.replace('            isShrinkResources = true','''            isShrinkResources = true
                       applicationIdSuffix = ".dev"
-                      versionNameSuffix = "-'''+('base' if variant=='base' else ('sort' if variant=='sort' else 'zora'))+'''"
+                      versionNameSuffix = "-'''+('base' if variant=='base' else ('sort' if variant=='sort' else ('zorasort' if variant=='voicesort' else 'zora')))+'''"
                       signingConfig = signingConfigs.getByName("voiceTest")''');p.write_text(s)
           p=out/'gradle/libs.versions.toml';s=p.read_text();assert 'version-code = "63"' in s;assert 'commonsIo = "2.5"' in s
-          s=s.replace('version-code = "63"','version-code = "'+('66' if variant=='base' else ('68' if variant=='sort' else '67'))+'"').replace('commonsIo = "2.5"','commonsIo = "2.22.0"');p.write_text(s)
+          s=s.replace('version-code = "63"','version-code = "'+('66' if variant=='base' else ('68' if variant=='sort' else ('69' if variant=='voicesort' else '67')))+'"').replace('commonsIo = "2.5"','commonsIo = "2.22.0"');p.write_text(s)
           p=out/'gradle.properties';s=p.read_text().replace('isFullBuild=true','isFullBuild=false');assert 'isFullBuild=false' in s;p.write_text(s)
           # Preserve the existing personal-fork compatibility fix. No official signature is forged.
           p=out/'androidApp/src/main/java/com/maxrave/simpmusic/MainActivity.kt';s=p.read_text();line='        if (!BuildConfig.DEBUG) viewModel.checkOfficialBuild(packageName, signingCertSha256())\n';assert s.count(line)==1;s=s.replace(line,'');p.write_text(s)
-          if variant=='voice':
+          if variant in ('voice','voicesort'):
            # Exact existing voice18 changes, with only two moved resource/settings anchors adapted.
            files=['androidApp/src/main/AndroidManifest.xml','composeApp/src/androidMain/kotlin/com/maxrave/simpmusic/expect/ui/VoiceListening.android.kt','composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/expect/ui/VoiceListening.kt','composeApp/src/jvmMain/kotlin/com/maxrave/simpmusic/expect/ui/VoiceListening.jvm.kt']
            for f in files:
@@ -71,17 +71,19 @@ jobs:
            s=s.replace('</resources>','    <string name="voice_listen_section">Voice listening</string>\n    <string name="voice_listen_title">Hands-free listening ("Hey Zora")</string>\n    <string name="voice_mod_credit">Voice-control modifications by Arhaan Ansari</string>\n</resources>');p.write_text(s)
            p=out/'composeApp/src/commonMain/kotlin/com/maxrave/simpmusic/ui/screen/home/SettingScreen.kt';s=p.read_text();anchor='import com.maxrave.simpmusic.expect.ui.LoginSyncDialog';assert s.count(anchor)==1;s=s.replace(anchor,'import com.maxrave.simpmusic.expect.ui.VoiceListeningSettingGroup\n'+anchor)
            anchor='        item(key = "discord") {';assert s.count(anchor)==1;s=s.replace(anchor,'        item(key = "voiceListening") {\n            VoiceListeningSettingGroup()\n        }\n'+anchor);p.write_text(s)
-           text=(root/'.github/workflows/voice-release-build.yml').read_text()
-           paths=re.findall(r'run: git -C core apply ../(patches/[^\n]+)',text)
-           assert len(paths)==14, paths
-           for f in paths:subprocess.run(['git','apply',str(root/f)],cwd=out/'core',check=True)
+           # Explicit voice18 core patch list (self-contained; no longer regexed from any workflow text).
+           paths=['patches/'+n for n in ['voice-liked-search.patch','voice-wakeword-listener.patch','voice-diagnostics.patch','voice-fixes.patch','voice-liked-import.patch','voice-matching-wake.patch','voice-wake-diagnostics.patch','voice-sherpa-wake.patch','voice-mic-health.patch','voice-command-cue.patch','voice-match-popularity.patch','voice-battery-lazy.patch','voice-clean-ui.patch','voice18-random-liked.patch']]  # exact voice18 apply order
+           for f2 in paths:
+            assert (root/f2).exists(), f2
+            subprocess.run(['git','apply',str(root/f2)],cwd=out/'core',check=True)
            (out/'NOTICE-voice-listener.md').write_bytes((root/'NOTICE-voice-listener.md').read_bytes())
-          if variant=='sort':
+          if variant in ('sort','voicesort'):
            # Liked-sort update: liked-import patch (shared with voice) plus the autosort patch. No voice files.
            for f in ['patches/voice-liked-import.patch','patches/voice-liked-autosort.patch']:
+            if variant=='voicesort' and f=='patches/voice-liked-import.patch': continue  # already in the voice set
             subprocess.run(['git','apply',str(root/f)],cwd=out/'core',check=True)
           # Adapt the existing voice18 liked-import fixture to upstream's new explicit sync dependency.
-          if variant in ('voice','sort'):
+          if variant in ('voice','sort','voicesort'):
            p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/repository/ImportLikedRegressionTest.kt';s=p.read_text()
            anchor='LocalDataSource(dao, db)';assert s.count(anchor)==1
            s=s.replace(anchor,'''LocalDataSource(dao, db, com.maxrave.data.librarysync.SyncChangeRecorder(db.getSyncDao(),
@@ -92,7 +94,7 @@ jobs:
                               val updated = transform(state.value); state.value = updated; return updated
                           }
                       })))''');p.write_text(s)
-          if variant=='sort':
+          if variant in ('sort','voicesort'):
            # Liked-songs sorting UI: one-time sort button in Settings > Backup, result toasts, credit.
            p=out/'composeApp/src/commonMain/composeResources/values/strings.xml';s=p.read_text();assert s.count('</resources>')==1
            s=s.replace('</resources>','    <string name="liked_sort_title">Sort liked songs</string>\n    <string name="liked_sort_subtitle">File every liked song into the Phonk, English and Hindi playlists. New likes are sorted automatically.</string>\n    <string name="liked_sort_done">Liked songs sorted - %1$d added to the Phonk, English and Hindi playlists</string>\n    <string name="liked_sort_failed">Could not sort liked songs</string>\n    <string name="liked_sort_mod_credit">Liked-songs sorting by Arhaan Ansari</string>\n</resources>');p.write_text(s)
@@ -163,8 +165,11 @@ jobs:
           No user data is intentionally cleared. Back up externally before update. Actual phone testing remains necessary.
           Optional computer pairing stays unconfigured unless user sets it up; code-review concerns remain documented separately.
           ''')
-          if variant=='sort':
-           p=out/'PERSONAL-UPDATE-NOTES.md';p.write_text(p.read_text()+'Sort variant: liked-songs bucket playlists (Phonk / English / Hindi) with a one-time sort button in Settings and automatic sorting of new likes. No voice pack included.\n')
+          if variant in ('sort','voicesort'):
+           note = 'Sort variant: liked-songs bucket playlists (Phonk / English / Hindi) with a one-time sort button in Settings and automatic sorting of new likes. No voice pack included.\n'
+           if variant=='voicesort':
+            note = 'Zora+Sort variant: the full Zora voice pack is kept exactly as in version 67, and liked-songs bucket playlists (Phonk / English / Hindi) are added with a one-time sort button in Settings and automatic sorting of new likes.\n'
+           p=out/'PERSONAL-UPDATE-NOTES.md';p.write_text(p.read_text()+note)
           # Upstream JVM regression helper accepts null in its own tests, as production SyncChangeEntity does.
           p=out/'core/data/src/jvmTest/kotlin/com/maxrave/data/librarysync/SyncSupportTest.kt';s=p.read_text();assert s.count('value: String = ON')==1
           s=s.replace('value: String = ON','value: String? = ON');p.write_text(s)
@@ -234,7 +239,7 @@ jobs:
           keytool -exportcert -alias "$KEY_ALIAS" -keystore "$RUNNER_TEMP/voice-test.keystore" -storepass:env STORE_PASS -file "$RUNNER_TEMP/voice-cert.der"
           echo "65e4f2d45b70c95b1ea21e647e52a0a9153b5f7723771db30ae54feb65388c9f  $RUNNER_TEMP/voice-cert.der" | sha256sum -c -
       - name: Fetch sherpa-onnx v2.0.1 Kotlin API, arm64 libs and KWS model (every file sha256-verified)
-        if: matrix.variant == 'voice'
+        if: matrix.variant == 'voice' || matrix.variant == 'voicesort'
         working-directory: prepared
         run: |
           set -euo pipefail
@@ -281,7 +286,7 @@ jobs:
           )
 
       - name: Fetch offline speech model (sha256-verified)
-        if: matrix.variant == 'voice'
+        if: matrix.variant == 'voice' || matrix.variant == 'voicesort'
         working-directory: prepared
         run: |
           curl -fsSL "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" -o "$RUNNER_TEMP/vosk-model.zip"
@@ -331,6 +336,10 @@ jobs:
           elif [ "$VARIANT" = sort ]; then
             grep -q "versionCode='68'" deliver/identity.txt
             if grep -q 'assets/kws/' deliver/zip-list.txt; then echo 'Unexpected voice model in sort'; exit 1; fi
+          elif [ "$VARIANT" = voicesort ]; then
+            grep -q "versionCode='69'" deliver/identity.txt
+            grep 'assets/kws/tokens.txt' deliver/zip-list.txt
+            grep 'assets/model-en-us/uuid' deliver/zip-list.txt
           else
             grep -q "versionCode='67'" deliver/identity.txt
             grep 'assets/kws/tokens.txt' deliver/zip-list.txt

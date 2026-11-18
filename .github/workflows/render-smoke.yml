@@ -31,7 +31,7 @@ jobs:
       - name: Download the verified sort APK artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: simpmusic-260-sort
+          name: simpmusic-260-voicesort
           run-id: ${{ env.SORT_RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: apk
